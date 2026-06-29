@@ -213,23 +213,27 @@ func TestIsRetryablePostgresError(t *testing.T) {
 	// syntax_error is NOT retryable
 	require.False(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "42601"}))
 
-	// EOF is retryable (connection severed)
-	require.True(t, database.IsRetryablePostgresError(io.EOF))
-	require.True(t, database.IsRetryablePostgresError(io.ErrUnexpectedEOF))
-
-	// net.OpError is retryable
-	require.True(t, database.IsRetryablePostgresError(&net.OpError{
+	// Network errors (EOF, net.OpError) are NOT retryable here: without an
+	// explicit transaction there is no way to know whether the error occurred
+	// before or after the server accepted the query, so retrying could
+	// duplicate committed work. Use RetryPostgresTx (whose classifier adds
+	// network errors back in) for transactional retry.
+	require.False(t, database.IsRetryablePostgresError(io.EOF))
+	require.False(t, database.IsRetryablePostgresError(io.ErrUnexpectedEOF))
+	require.False(t, database.IsRetryablePostgresError(&net.OpError{
 		Op:  "read",
 		Err: errors.New("connection reset by peer"),
 	}))
 
+	// String-matched connection errors are NOT retryable: string matching is
+	// fragile, and the typed checks above (plus driver.ErrBadConn and
+	// pgconn.SafeToRetry in the transactional classifier) cover the real cases.
+	require.False(t, database.IsRetryablePostgresError(errors.New("connection reset by peer")))
+	require.False(t, database.IsRetryablePostgresError(errors.New("broken pipe")))
+	require.False(t, database.IsRetryablePostgresError(errors.New("conn closed")))
+
 	// context.DeadlineExceeded is NOT retryable
 	require.False(t, database.IsRetryablePostgresError(context.DeadlineExceeded))
-
-	// String-matched connection errors
-	require.True(t, database.IsRetryablePostgresError(errors.New("connection reset by peer")))
-	require.True(t, database.IsRetryablePostgresError(errors.New("broken pipe")))
-	require.True(t, database.IsRetryablePostgresError(errors.New("conn closed")))
 
 	// Random application error is NOT retryable
 	require.False(t, database.IsRetryablePostgresError(errors.New("invalid input")))

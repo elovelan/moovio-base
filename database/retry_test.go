@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 	"testing"
 
@@ -315,8 +316,17 @@ func TestIsRetryablePostgresTxError(t *testing.T) {
 	require.False(t, isRetryablePostgresTxError(errors.New("some application error")))
 	// Non-retryable: context cancellation is never retryable.
 	require.False(t, isRetryablePostgresTxError(context.Canceled))
-	// Network errors are retryable via IsRetryablePostgresError's typed checks.
+
+	// Leg 4: isPostgresNetworkError (typed network errors — safe within a
+	// transaction because the server rolls back the uncommitted tx). These are
+	// intentionally NOT in IsRetryablePostgresError (unsafe without a tx), but
+	// IS safe here.
 	require.True(t, isRetryablePostgresTxError(io.EOF))
+	require.True(t, isRetryablePostgresTxError(io.ErrUnexpectedEOF))
+	require.True(t, isRetryablePostgresTxError(&net.OpError{
+		Op:  "read",
+		Err: errors.New("connection reset by peer"),
+	}))
 }
 
 func TestRetryMySQLTxNotImplemented(t *testing.T) {

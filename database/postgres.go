@@ -176,17 +176,23 @@ func PostgresDeadlockFound(err error) bool {
 	return strings.Contains(err.Error(), postgresErrDeadlockFound)
 }
 
-// IsRetryablePostgresError returns true if the error is a transient connection-level
-// error that is safe to retry. This covers the errors seen during AlloyDB maintenance
-// switchovers and other transient network failures.
+// IsRetryablePostgresError returns true if the error is a PostgreSQL SQLSTATE
+// code that the server guarantees was rolled back before the error was
+// returned. These are safe to retry even without an explicit transaction
+// because the server has already undone any partial work.
+//
+// Network-level errors (connection reset, broken pipe, EOF, etc.) are
+// intentionally NOT classified as retryable here: without an explicit
+// transaction there is no way to know whether the error occurred before or
+// after the server accepted the query, so retrying could duplicate committed
+// work. Callers who wrap their work in a transaction should use RetryPostgresTx,
+// whose classifier (isRetryablePostgresTxError) adds network errors back in
+// because the transaction makes them safe to retry.
 func IsRetryablePostgresError(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	// PostgreSQL error codes that are safe to retry because the server guarantees
-	// the transaction was rolled back before the error was returned.
-	//
 	// 57P01 admin_shutdown, 57P02 crash_shutdown: fast shutdown rolls back all
 	// active transactions before disconnecting clients. See:
 	// https://www.postgresql.org/docs/current/server-shutdown.html
@@ -204,48 +210,43 @@ func IsRetryablePostgresError(err error) bool {
 	// this error.
 	//
 	// Note: 08xxx (connection_exception class) codes are intentionally omitted.
-	// pgx surfaces connection-level failures as TCP/network errors, not as
-	// *pgconn.PgError, so those cases are handled below.
+	// pgx surfaces connection-level failures as network errors, not as
+	// *pgconn.PgError, so those cases are handled by isPostgresNetworkError
+	// (used by isRetryablePostgresTxError within a transaction).
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case "57P01", "57P02", "57P03", // admin_shutdown, crash_shutdown, cannot_connect_now
 			"40001", "40P01", // serialization_failure, deadlock_detected
-			"53300",          // too_many_connections
-			"57014":          // query_canceled
+			"53300", // too_many_connections
+			"57014": // query_canceled
 			return true
 		}
 		return false
 	}
 
-	// Network-level errors: connection reset, broken pipe, EOF, etc.
-	// These occur when the TCP connection is severed during a switchover.
+	// Non-PgError errors (network errors, context errors, application errors)
+	// are not retryable here — see the doc comment above.
+	return false
+}
+
+// isPostgresNetworkError returns true for typed network-level errors that
+// indicate the TCP connection was severed. These are safe to retry ONLY within
+// an explicit transaction (the server rolls back the uncommitted transaction),
+// so this helper is used by isRetryablePostgresTxError and NOT by
+// IsRetryablePostgresError.
+//
+// String-matching on error messages is intentionally avoided: pgx flags
+// pre-send failures via pgconn.SafeToRetry (which the stdlib adapter converts
+// to driver.ErrBadConn), and post-send failures surface as typed net.OpError /
+// io errors, so the typed checks are sufficient and far less fragile than
+// substring matching.
+func isPostgresNetworkError(err error) bool {
 	var netErr *net.OpError
 	if errors.As(err, &netErr) {
 		return true
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return false // don't retry if the caller's context timed out
-	}
-
-	// pgx sometimes wraps TCP-level disconnection errors as plain strings rather
-	// than preserving the original net.OpError type. These are safe to retry
-	// because they occur on the write path — the server never received the query.
-	// "conn closed" is pgx's own sentinel for a connection already closed before use.
-	// Note: "connection refused" and "unexpected EOF" are intentionally excluded —
-	// the former does not appear in pgx's codebase, the latter is already caught
-	// above by errors.Is(err, io.ErrUnexpectedEOF).
-	msg := err.Error()
-	if strings.Contains(msg, "connection reset by peer") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "conn closed") {
-		return true
-	}
-
-	return false
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // retryJitterMax is the upper bound for the random delay between retries.
@@ -259,7 +260,7 @@ func IsRetryablePostgresError(err error) bool {
 const retryJitterMax = 100 * time.Millisecond
 
 // isRetryablePostgresTxError is the default classifier used by RetryPostgresTx.
-// It is the OR of three signals:
+// It is the OR of four signals:
 //
 //  1. errors.Is(err, driver.ErrBadConn) — covers fn's tx.Exec/tx.Query
 //     pre-send failures. pgx's stdlib adapter converts pgconn.SafeToRetry-
@@ -273,6 +274,16 @@ const retryJitterMax = 100 * time.Millisecond
 //     that guarantee rollback (40001, 40P01, 57P01, 57P02, 57P03, 53300,
 //     57014). These are NOT SafeToRetry-flagged by pgx and flow through
 //     unchanged.
+//  4. isPostgresNetworkError(err) — covers typed network errors (net.OpError,
+//     io.EOF, io.ErrUnexpectedEOF) where the TCP connection was severed.
+//     These are safe to retry within an explicit transaction because the
+//     server rolls back the uncommitted transaction. This leg is intentionally
+//     NOT part of IsRetryablePostgresError (which is for use without a
+//     transaction, where network errors are unsafe because you can't know if
+//     the query landed). The residual timing issue — commit succeeded but the
+//     response was lost — is accepted here and will be addressed by the
+//     stacked pg_current_xact_id()/pg_xact_status() commit-verification
+//     follow-up.
 //
 // driver.ErrBadConn is backend-agnostic, so the same "retry on bad conn"
 // leg will carry over to RetryMySQLTx / RetrySpannerTx when implemented.
@@ -281,6 +292,9 @@ func isRetryablePostgresTxError(err error) bool {
 		return true
 	}
 	if pgconn.SafeToRetry(err) {
+		return true
+	}
+	if isPostgresNetworkError(err) {
 		return true
 	}
 	return IsRetryablePostgresError(err)
