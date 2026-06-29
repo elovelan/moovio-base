@@ -245,3 +245,18 @@ func MySQLDeadlockFound(err error) bool {
 
 	return strings.Contains(err.Error(), fmt.Sprintf("Error %d", mysqlErrDeadlockFound))
 }
+
+// RetryMySQLTx is the MySQL equivalent of RetryPostgresTx.
+// TODO: implement with MySQL retryable codes (1213 deadlock, 1205 lock wait
+// timeout, 2013 connection lost, network resets). The shared retryTx helper
+// in retry.go already handles driver.ErrBadConn (backend-agnostic) and the
+// Begin/fn/Commit/Rollback loop; the missing piece is a MySQL-specific
+// default classifier analogous to isRetryablePostgresTxError. See
+// https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html
+func RetryMySQLTx(ctx context.Context, db *sql.DB, opts RetryTxOptions, fn func(*sql.Tx) error) error {
+	_ = ctx
+	_ = db
+	_ = opts
+	_ = fn
+	return errors.New("database: RetryMySQLTx is not yet implemented; see TODO")
+}

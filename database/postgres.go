@@ -3,10 +3,10 @@ package database
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"strings"
 	"time"
@@ -258,30 +258,43 @@ func IsRetryablePostgresError(err error) bool {
 // hatch for services with tighter latency budgets.
 const retryJitterMax = 100 * time.Millisecond
 
-// RetryPostgres executes fn up to maxAttempts times, retrying on transient
-// connection errors. This is intended for use around individual database
-// operations to survive brief outages like AlloyDB maintenance switchovers.
-func RetryPostgres(ctx context.Context, maxAttempts int, fn func() error) error {
-	if maxAttempts <= 0 {
-		maxAttempts = 3
+// isRetryablePostgresTxError is the default classifier used by RetryPostgresTx.
+// It is the OR of three signals:
+//
+//  1. errors.Is(err, driver.ErrBadConn) — covers fn's tx.Exec/tx.Query
+//     pre-send failures. pgx's stdlib adapter converts pgconn.SafeToRetry-
+//     flagged errors from Exec/Query into driver.ErrBadConn before
+//     database/sql (and thus fn) sees them, discarding the original pgx
+//     error. This is the primary retry trigger inside a transaction.
+//  2. pgconn.SafeToRetry(err) — covers Begin/Commit failures where the
+//     original pgx error flows through unchanged (connect errors, conn-busy,
+//     HA NotPreferredError, pre-send timeouts).
+//  3. IsRetryablePostgresError(err) — covers server-returned SQLSTATE codes
+//     that guarantee rollback (40001, 40P01, 57P01, 57P02, 57P03, 53300,
+//     57014). These are NOT SafeToRetry-flagged by pgx and flow through
+//     unchanged.
+//
+// driver.ErrBadConn is backend-agnostic, so the same "retry on bad conn"
+// leg will carry over to RetryMySQLTx / RetrySpannerTx when implemented.
+func isRetryablePostgresTxError(err error) bool {
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
 	}
-	var err error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err = fn()
-		if err == nil {
-			return nil
-		}
-		if !IsRetryablePostgresError(err) {
-			return err
-		}
-		if attempt < maxAttempts-1 {
-			delay := time.Duration(rand.Int63n(int64(retryJitterMax)))
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-		}
+	if pgconn.SafeToRetry(err) {
+		return true
 	}
-	return err
+	return IsRetryablePostgresError(err)
+}
+
+// RetryPostgresTx executes fn inside a Postgres transaction, retrying the
+// entire transaction on transient errors. fn receives a fresh *sql.Tx each
+// attempt; if fn returns an error the tx is rolled back, if nil the tx is
+// committed. An error is retried when isRetryablePostgresTxError(err) OR
+// opts.IsRetryable(err) is true.
+//
+// db MUST be a *sql.DB backed by the pgx stdlib adapter (e.g. one returned
+// by database.New with a PostgresConfig). Using a *sql.DB backed by another
+// driver will not produce pgx-specific retries.
+func RetryPostgresTx(ctx context.Context, db *sql.DB, opts RetryTxOptions, fn func(*sql.Tx) error) error {
+	return retryTx(ctx, db, isRetryablePostgresTxError, opts, fn)
 }

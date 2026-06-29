@@ -235,10 +235,10 @@ func TestIsRetryablePostgresError(t *testing.T) {
 	require.False(t, database.IsRetryablePostgresError(errors.New("invalid input")))
 }
 
-func TestRetryPostgres(t *testing.T) {
+func TestRetryUnsafe(t *testing.T) {
 	t.Run("succeeds on first attempt", func(t *testing.T) {
 		calls := 0
-		err := database.RetryPostgres(context.Background(), 3, func() error {
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
 			calls++
 			return nil
 		})
@@ -246,12 +246,15 @@ func TestRetryPostgres(t *testing.T) {
 		require.Equal(t, 1, calls)
 	})
 
-	t.Run("retries on transient error then succeeds", func(t *testing.T) {
+	t.Run("retries on any error by default, including non-Pg-retryable ones", func(t *testing.T) {
+		// unique_violation is NOT retryable per IsRetryablePostgresError, but
+		// RetryUnsafe's default predicate retries any error except context
+		// cancellation because the caller has vouched that fn is idempotent.
 		calls := 0
-		err := database.RetryPostgres(context.Background(), 3, func() error {
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
 			calls++
 			if calls < 3 {
-				return &pgconn.PgError{Code: "57P01"} // admin_shutdown
+				return &pgconn.PgError{Code: "23505"} // unique_violation
 			}
 			return nil
 		})
@@ -259,33 +262,46 @@ func TestRetryPostgres(t *testing.T) {
 		require.Equal(t, 3, calls)
 	})
 
-	t.Run("does not retry non-retryable errors", func(t *testing.T) {
+	t.Run("custom IsRetryable short-circuits non-retryable errors", func(t *testing.T) {
 		calls := 0
-		err := database.RetryPostgres(context.Background(), 3, func() error {
+		neverRetry := func(error) bool { return false }
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3, IsRetryable: neverRetry}, func() error {
 			calls++
-			return &pgconn.PgError{Code: "23505"} // unique_violation
+			return io.EOF
 		})
 		require.Error(t, err)
 		require.Equal(t, 1, calls)
+		require.ErrorIs(t, err, io.EOF)
 	})
 
-	t.Run("respects context cancellation", func(t *testing.T) {
+	t.Run("does not retry context cancellation by default", func(t *testing.T) {
+		calls := 0
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
+			calls++
+			return context.Canceled
+		})
+		require.Error(t, err)
+		require.Equal(t, 1, calls)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("respects context cancellation between attempts", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // cancel immediately
 
 		calls := 0
-		err := database.RetryPostgres(ctx, 3, func() error {
+		err := database.RetryUnsafe(ctx, database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
 			calls++
 			return io.EOF // retryable, but context is done
 		})
-		// First call happens, then context cancellation is detected
+		// First call happens, then context cancellation is detected before the next attempt
 		require.ErrorIs(t, err, context.Canceled)
 		require.Equal(t, 1, calls)
 	})
 
 	t.Run("exhausts all attempts", func(t *testing.T) {
 		calls := 0
-		err := database.RetryPostgres(context.Background(), 3, func() error {
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
 			calls++
 			return io.EOF
 		})
