@@ -6,7 +6,6 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strings"
 	"time"
@@ -191,17 +190,16 @@ func PostgresDeadlockFound(err error) bool {
 //     57P01, 57P02, 57P03, 53300, 57014) — the server rolled back the
 //     transaction before returning the error.
 //
-// It is used directly as the commit-phase classifier for RetryPostgresTx
-// (where network errors are NOT safe because the commit may have succeeded —
-// see ErrCommitPhase) and as the foundation of the pre-commit classifier
-// isRetryablePostgresPreCommitError (which adds network errors via
-// isPostgresNetworkError, since pre-commit the transaction rolls back).
+// It is used directly as the commit-phase classifier for RetryPostgresTx.
+// The pre-commit classifier (isRetryablePostgresPreCommitError) is a separate
+// opt-out classifier that retries a broader set, because pre-commit the
+// transaction rolls back so retrying is always safe.
 //
 // Network-level errors (net.OpError, io.EOF) are intentionally NOT classified
 // here: without an explicit transaction there is no way to know whether the
 // error occurred before or after the server accepted the query, and at commit
 // time a network error could mean the commit succeeded but the response was
-// lost.
+// lost (see ErrCommitPhase).
 //
 // This is unexported because the recommended path for callers is RetryPostgresTx
 // (safe, transactional) or RetryUnsafe (idempotent caller), not building a
@@ -238,10 +236,12 @@ func isSafeRetryablePostgresError(err error) bool {
 	// 57014 query_canceled: the server rolled back the transaction before returning
 	// this error.
 	//
-	// Note: 08xxx (connection_exception class) codes are intentionally omitted.
-	// pgx surfaces connection-level failures as network errors, not as
-	// *pgconn.PgError, so those cases are handled by isPostgresNetworkError
-	// (used by isRetryablePostgresPreCommitError within a transaction).
+	// Note: 08xxx (connection_exception class) codes are intentionally omitted
+	// here. pgx surfaces connection-level failures as network errors, not as
+	// *pgconn.PgError; the pre-commit classifier (isRetryablePostgresPreCommitError)
+	// retries those because pre-commit the transaction rolls back. At commit time
+	// they would be wrapped with ErrCommitPhase (conservative — no server response
+	// means the commit may have succeeded).
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
@@ -256,23 +256,29 @@ func isSafeRetryablePostgresError(err error) bool {
 	return false
 }
 
-// isPostgresNetworkError returns true for typed network-level errors that
-// indicate the TCP connection was severed. These are safe to retry ONLY within
-// an explicit transaction (the server rolls back the uncommitted transaction),
-// so this helper is used by isRetryablePostgresPreCommitError and NOT by
-// isSafeRetryablePostgresError.
+// isPermanentPostgresError returns true for PostgreSQL SQLSTATE classes that
+// indicate a permanent error which would fail again on retry. Used by the
+// pre-commit classifier (isRetryablePostgresPreCommitError) to opt OUT of
+// retrying these — pre-commit retrying them would be safe (the transaction
+// rolls back) but futile, adding ~200ms of latency before the caller receives
+// the error. The classes blocked here all surface at query time (not connection
+// time) and don't resolve across retries:
 //
-// String-matching on error messages is intentionally avoided: pgx flags
-// pre-send failures via pgconn.SafeToRetry (which the stdlib adapter converts
-// to driver.ErrBadConn), and post-send failures surface as typed net.OpError /
-// io errors, so the typed checks are sufficient and far less fragile than
-// substring matching.
-func isPostgresNetworkError(err error) bool {
-	var netErr *net.OpError
-	if errors.As(err, &netErr) {
-		return true
-	}
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+//   - 22xxx data exceptions (e.g. string_data_right_truncation 22001)
+//   - 23xxx integrity constraint violations (e.g. unique_violation 23505,
+//     foreign_key_violation 23503)
+//   - 42xxx syntax/access-rule violations (includes 42501
+//     insufficient_privilege, 42601 syntax_error, undefined_table 42P01,
+//     undefined_column 42703, datatype_mismatch 42804)
+//
+// Other classes (e.g. 08xxx connection exceptions, 58xxx system errors, XX000
+// internal_error) are NOT blocked: they may be transient, and pre-commit
+// retrying them is safe. Blocking only the clearly-permanent classes keeps the
+// blocklist conservative so we don't accidentally skip a retryable error.
+func isPermanentPostgresError(pgErr *pgconn.PgError) bool {
+	return strings.HasPrefix(pgErr.Code, "22") || // data exception
+		strings.HasPrefix(pgErr.Code, "23") || // integrity constraint violation
+		strings.HasPrefix(pgErr.Code, "42") // syntax / access rule violation
 }
 
 // retryJitterMax is the upper bound for the random delay between retries.
@@ -287,34 +293,58 @@ const retryJitterMax = 100 * time.Millisecond
 
 // isRetryablePostgresPreCommitError is the default classifier used by
 // RetryPostgresTx for errors that occur BEFORE Commit is called (i.e., from
-// BeginTx or fn). It is isSafeRetryablePostgresError OR isPostgresNetworkError:
-// pre-commit, typed network errors are also safe to retry because the server
-// rolls back the uncommitted transaction.
+// BeginTx or fn). Pre-commit, retrying is ALWAYS safe: the transaction rolls
+// back, so a retried attempt starts from a clean slate. To avoid missing a
+// transient error we haven't enumerated, this classifier OPTS OUT of retrying
+// only the errors known to be permanent; everything else is retried.
 //
-// Permanent application errors are intentionally NOT retried here, even though
-// retrying them would be safe (the transaction rolls back): they would fail
-// again on the next attempt, so retrying only adds ~200ms of latency (3
-// attempts with full-jitter backoff up to retryJitterMax) before the caller
-// receives the error. The categories we deliberately do NOT retry are:
+// NOT retried (would fail again on the next attempt, so retrying only adds
+// ~200ms of latency before the caller receives the error):
 //
-//   - Constraint violations (class 23xxx) — e.g. unique_violation 23505,
-//     foreign_key_violation 23503, check_violation 23514, not_null_violation
-//     23502. The data conflict persists across retries.
-//   - Syntax errors (42601) — the SQL is malformed; indicates a code bug.
-//   - Schema errors (class 42xxx) — e.g. undefined_table 42P01,
-//     undefined_column 42703. Indicates a migration drift or code bug.
-//   - Permission errors (42501 insufficient_privilege) — permissions don't
-//     change mid-query.
-//   - Data exceptions (class 22xxx) — e.g. string_data_right_truncation 22001,
-//     datatype_mismatch 42804. The data doesn't fit the column/type.
+//   - context.Canceled / context.DeadlineExceeded: the caller's context is
+//     done; retrying would hit the deadline immediately.
+//   - Permanent PostgreSQL SQLSTATE classes — see isPermanentPostgresError:
+//       * 22xxx data exceptions (e.g. string_data_right_truncation 22001)
+//       * 23xxx integrity constraint violations (e.g. unique_violation 23505,
+//         foreign_key_violation 23503)
+//       * 42xxx syntax/access-rule violations (42501 insufficient_privilege,
+//         42601 syntax_error, undefined_table 42P01, undefined_column 42703,
+//         datatype_mismatch 42804)
 //
-// These are discovered at query time (not connection time, where
-// incompatibility/handshake failures surface), so they reach fn and would
-// recur on retry. Callers who want to retry a broader set (e.g. a custom
-// "transaction rolled back" sentinel from a stored procedure) can pass
-// opts.IsRetryable, which is additive on top of this classifier.
+// Retried (transient or unknown): everything else — including driver.ErrBadConn,
+// pgconn.SafeToRetry-flagged errors, typed network errors (net.OpError, io.EOF),
+// the known-transient SQLSTATE codes (40001, 40P01, 57P01, 57P02, 57P03, 53300,
+// 57014), any *pgconn.PgError whose code is NOT in the permanent blocklist
+// (opt-out — assume retryable unless known permanent, to avoid spurious
+// failures on transient errors we haven't enumerated), and any other non-
+// PgError error.
+//
+// The cost of a false positive (retrying a permanent error we didn't blocklist)
+// is ~200ms of wasted latency; the cost of a false negative (NOT retrying a
+// transient error we didn't allowlist) is a spurious user-facing failure.
+// Pre-commit the former is strictly safer, so we opt out.
+//
+// Callers who want to ALSO opt out of retrying additional errors should pass
+// opts.IsRetryable that returns false for them. Note that opts.IsRetryable is
+// ADDITIVE (it can only widen the retry set via OR), so to NARROW it you'd need
+// a wrapper that re-checks; if narrowing is a common need we can revisit the
+// composition semantics.
 func isRetryablePostgresPreCommitError(err error) bool {
-	return isSafeRetryablePostgresError(err) || isPostgresNetworkError(err)
+	if err == nil {
+		return false
+	}
+	// Caller's context is done — retrying would hit the deadline immediately.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Permanent SQLSTATE codes would fail again on retry.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return !isPermanentPostgresError(pgErr)
+	}
+	// Everything else (network errors, driver.ErrBadConn, SafeToRetry-flagged,
+	// unknown errors) is retried — pre-commit the transaction rolls back.
+	return true
 }
 
 // RetryPostgresTx executes fn inside a Postgres transaction, retrying the
@@ -323,20 +353,21 @@ func isRetryablePostgresPreCommitError(err error) bool {
 // committed.
 //
 // Pre-commit errors (from BeginTx or fn) are retried when
-// isRetryablePostgresPreCommitError(err) OR opts.IsRetryable(err) is true — a
-// broad set (pre-send + server-rolled-back + network), because the transaction
-// rolls back so retrying is safe. Permanent application errors (constraint
-// violations, syntax/schema/permission errors) are NOT retried; see
-// isRetryablePostgresPreCommitError's doc for the full list.
+// isRetryablePostgresPreCommitError(err) OR opts.IsRetryable(err) is true.
+// isRetryablePostgresPreCommitError is an OPT-OUT classifier: pre-commit
+// retrying is always safe (the transaction rolls back), so it retries
+// everything EXCEPT context.Canceled/DeadlineExceeded and the permanent
+// SQLSTATE classes (22xxx data exceptions, 23xxx constraint violations, 42xxx
+// syntax/schema/permission). See its doc for the rationale.
 //
 // Commit-phase errors (from (*sql.Tx).Commit) are retried only when
 // isSafeRetryablePostgresError(err) OR opts.IsRetryable(err) is true — a
-// narrower set (pre-send + server-rolled-back; network errors excluded),
-// because a commit-phase network error may mean the commit already succeeded
-// (e.g., the connection was severed after the COMMIT was sent but before the
-// response was received). Commit-phase errors that are NOT retried are
-// returned to the caller wrapped with ErrCommitPhase so the caller can decide
-// whether to alert, reconcile, or check via pg_xact_status() (future).
+// narrower OPT-IN set (pre-send + server-rolled-back SQLSTATE; network errors
+// excluded), because a commit-phase network error may mean the commit already
+// succeeded (e.g., the connection was severed after the COMMIT was sent but
+// before the response was received). Commit-phase errors that are NOT retried
+// are returned to the caller wrapped with ErrCommitPhase so the caller can
+// decide whether to alert, reconcile, or check via pg_xact_status() (future).
 //
 // db MUST be a *sql.DB backed by the pgx stdlib adapter (e.g. one returned
 // by database.New with a PostgresConfig). Using a *sql.DB backed by another
@@ -346,11 +377,12 @@ func RetryPostgresTx(ctx context.Context, db *sql.DB, opts RetryTxOptions, fn fu
 }
 
 // postgresTxClassifier is the per-phase retry classifier used by RetryPostgresTx.
-// The preCommit classifier is broad (pre-send + server-rolled-back + network —
-// any transient error is safe because the transaction rolls back); the commit
-// classifier is the narrow isSafeRetryablePostgresError (pre-send +
-// server-rolled-back; network excluded), because a commit-phase network error
-// may mean the commit already succeeded. See ErrCommitPhase.
+// The preCommit classifier is an OPT-OUT classifier (broad: retry everything
+// except permanent errors and context cancellation, because pre-commit the
+// transaction rolls back so retrying is always safe); the commit classifier is
+// the OPT-IN isSafeRetryablePostgresError (narrow: only pre-send +
+// server-rolled-back, because a commit-phase network error may mean the commit
+// already succeeded). See ErrCommitPhase.
 var postgresTxClassifier = retryClassifier{
 	preCommit: isRetryablePostgresPreCommitError,
 	commit:    isSafeRetryablePostgresError,

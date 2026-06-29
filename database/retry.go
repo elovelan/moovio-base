@@ -12,8 +12,6 @@ import (
 // RetryTxOptions configures the transactional (safe) retry functions
 // (RetryPostgresTx and the future RetryMySQLTx / RetrySpannerTx).
 type RetryTxOptions struct {
-	// MaxAttempts caps the number of transaction attempts. Defaults to 3 if <= 0.
-	MaxAttempts int
 	// TxOptions is passed to (*sql.DB).BeginTx on each attempt. nil = default isolation.
 	TxOptions *sql.TxOptions
 	// IsRetryable, if non-nil, is consulted IN ADDITION to the backend's default
@@ -26,12 +24,18 @@ type RetryTxOptions struct {
 
 // RetryUnsafeOptions configures RetryUnsafe.
 type RetryUnsafeOptions struct {
-	// MaxAttempts caps the number of attempts. Defaults to 3 if <= 0.
-	MaxAttempts int
 	// IsRetryable, if nil, defaults to "retry on any error except
 	// context.Canceled / context.DeadlineExceeded". If non-nil, replaces the default.
 	IsRetryable func(err error) bool
 }
+
+// maxRetryAttempts is the maximum number of attempts for RetryPostgresTx and
+// RetryUnsafe (the initial attempt plus 2 retries), matching database/sql's
+// maxBadConnRetries+1 convention. It is intentionally not configurable:
+// services that need a different retry budget should bound the total time via
+// the context deadline (the retry loop exits early when ctx is done) or wrap
+// the call in their own retry loop for more attempts.
+const maxRetryAttempts = 3
 
 // ErrCommitPhase wraps an error that occurred during the commit phase of a
 // retried transaction (i.e., from (*sql.Tx).Commit) and was NOT retried. A
@@ -75,21 +79,17 @@ func (c retryClassifier) classify(err error, commitPhase bool) bool {
 	return c.preCommit(err)
 }
 
-// RetryUnsafe executes fn up to MaxAttempts times, retrying on any error that
-// opts.IsRetryable classifies as retryable (default: any error except context
-// cancellation/deadline). fn MUST be idempotent — no transaction wrapper is
-// provided, so a retry may re-execute work that already committed.
+// RetryUnsafe executes fn up to maxRetryAttempts times, retrying on any error
+// that opts.IsRetryable classifies as retryable (default: any error except
+// context cancellation/deadline). fn MUST be idempotent — no transaction
+// wrapper is provided, so a retry may re-execute work that already committed.
 func RetryUnsafe(ctx context.Context, opts RetryUnsafeOptions, fn func() error) error {
-	maxAttempts := opts.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 3
-	}
 	isRetryable := opts.IsRetryable
 	if isRetryable == nil {
 		isRetryable = isRetryableUnsafeDefault
 	}
 	var err error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := 0; attempt < maxRetryAttempts; attempt++ {
 		err = fn()
 		if err == nil {
 			return nil
@@ -97,7 +97,7 @@ func RetryUnsafe(ctx context.Context, opts RetryUnsafeOptions, fn func() error) 
 		if !isRetryable(err) {
 			return err
 		}
-		if !sleepWithJitter(ctx, attempt, maxAttempts) {
+		if !sleepWithJitter(ctx, attempt, maxRetryAttempts) {
 			return ctx.Err()
 		}
 	}
@@ -120,11 +120,18 @@ func isRetryableUnsafeDefault(err error) bool {
 // ErrCommitPhase before being returned to the caller, so the caller can detect
 // that the error occurred during the commit phase (where the commit may have
 // succeeded before the error was returned).
+//
+// database/sql already retries driver.ErrBadConn internally for *sql.DB methods
+// (up to maxBadConnRetries=2, i.e. 3 total attempts) before surfacing it. That
+// internal retry is immediate (no delay) and handles transient bad connections
+// on fresh conns; this outer retry layers on top with full-jitter backoff to
+// survive longer outages (e.g. an AlloyDB switchover). The composition is
+// intentional: the internal retry covers the "connection was bad before I used
+// it" case without delay, and this outer retry covers the "the database was
+// briefly unavailable" case with jitter to spread fleet-wide retries. For
+// *sql.Tx methods (tx.Exec, tx.Commit) there is no internal retry, so this
+// outer retry is the only retry.
 func retryTx(ctx context.Context, db beginTxer, base retryClassifier, opts RetryTxOptions, fn func(*sql.Tx) error) error {
-	maxAttempts := opts.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 3
-	}
 	classifier := base
 	if opts.IsRetryable != nil {
 		extra := opts.IsRetryable
@@ -135,7 +142,7 @@ func retryTx(ctx context.Context, db beginTxer, base retryClassifier, opts Retry
 	}
 	var lastErr error
 	var lastCommitPhase bool
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := 0; attempt < maxRetryAttempts; attempt++ {
 		var commitPhase bool
 		lastErr, commitPhase = runOneTxAttempt(ctx, db, opts.TxOptions, fn)
 		lastCommitPhase = commitPhase
@@ -145,7 +152,7 @@ func retryTx(ctx context.Context, db beginTxer, base retryClassifier, opts Retry
 		if !classifier.classify(lastErr, commitPhase) {
 			break
 		}
-		if !sleepWithJitter(ctx, attempt, maxAttempts) {
+		if !sleepWithJitter(ctx, attempt, maxRetryAttempts) {
 			return ctx.Err()
 		}
 	}

@@ -185,7 +185,7 @@ func Test_Postgres_Alloy_Migrations(t *testing.T) {
 func TestRetryUnsafe(t *testing.T) {
 	t.Run("succeeds on first attempt", func(t *testing.T) {
 		calls := 0
-		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{}, func() error {
 			calls++
 			return nil
 		})
@@ -198,7 +198,7 @@ func TestRetryUnsafe(t *testing.T) {
 		// RetryUnsafe's default predicate retries any error except context
 		// cancellation because the caller has vouched that fn is idempotent.
 		calls := 0
-		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{}, func() error {
 			calls++
 			if calls < 3 {
 				return &pgconn.PgError{Code: "23505"} // unique_violation
@@ -212,7 +212,7 @@ func TestRetryUnsafe(t *testing.T) {
 	t.Run("custom IsRetryable short-circuits non-retryable errors", func(t *testing.T) {
 		calls := 0
 		neverRetry := func(error) bool { return false }
-		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3, IsRetryable: neverRetry}, func() error {
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{IsRetryable: neverRetry}, func() error {
 			calls++
 			return io.EOF
 		})
@@ -223,7 +223,7 @@ func TestRetryUnsafe(t *testing.T) {
 
 	t.Run("does not retry context cancellation by default", func(t *testing.T) {
 		calls := 0
-		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{}, func() error {
 			calls++
 			return context.Canceled
 		})
@@ -237,7 +237,7 @@ func TestRetryUnsafe(t *testing.T) {
 		cancel() // cancel immediately
 
 		calls := 0
-		err := database.RetryUnsafe(ctx, database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
+		err := database.RetryUnsafe(ctx, database.RetryUnsafeOptions{}, func() error {
 			calls++
 			return io.EOF // retryable, but context is done
 		})
@@ -248,7 +248,7 @@ func TestRetryUnsafe(t *testing.T) {
 
 	t.Run("exhausts all attempts", func(t *testing.T) {
 		calls := 0
-		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{MaxAttempts: 3}, func() error {
+		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{}, func() error {
 			calls++
 			return io.EOF
 		})

@@ -123,7 +123,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -139,7 +139,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			if calls < 2 {
 				return &pgconn.PgError{Code: "40001"} // serialization_failure -> retryable
@@ -161,7 +161,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			return &pgconn.PgError{Code: "23505"} // unique_violation -> NOT retryable
 		})
@@ -181,7 +181,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			if calls < 2 {
 				return driver.ErrBadConn
@@ -204,7 +204,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -221,7 +221,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -243,7 +243,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -271,7 +271,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -297,7 +297,6 @@ func TestRetryPostgresTx(t *testing.T) {
 
 		calls := 0
 		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{
-			MaxAttempts: 3,
 			IsRetryable: func(err error) bool { return errors.Is(err, sentinelErr) },
 		}, func(*sql.Tx) error {
 			calls++
@@ -319,7 +318,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(ctx, db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(ctx, db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			if calls == 1 {
 				cancel() // cancel after the first attempt runs
@@ -338,7 +337,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{MaxAttempts: 3}, func(*sql.Tx) error {
+		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
 			calls++
 			return &pgconn.PgError{Code: "40P01"} // deadlock_detected -> retryable
 		})
@@ -351,10 +350,12 @@ func TestRetryPostgresTx(t *testing.T) {
 }
 
 func TestIsSafeRetryablePostgresError(t *testing.T) {
-	// isSafeRetryablePostgresError is the "safe to retry at any phase"
-	// classifier — pre-send guarantees + server-rolled-back SQLSTATE codes.
-	// It is used directly as the commit-phase classifier for RetryPostgresTx
-	// and as the foundation of the pre-commit classifier.
+	// isSafeRetryablePostgresError is the OPT-IN commit-phase classifier for
+	// RetryPostgresTx: pre-send guarantees + server-rolled-back SQLSTATE codes.
+	// Network errors are excluded (at commit, a network error could mean the
+	// commit succeeded but the response was lost — see ErrCommitPhase). The
+	// pre-commit classifier (isRetryablePostgresPreCommitError) is a separate
+	// OPT-OUT classifier that retries a broader set.
 
 	// Pre-send: driver.ErrBadConn (pgx stdlib adapter only produces this for
 	// SafeToRetry-flagged Exec/Query errors) and pgconn.SafeToRetry-flagged
@@ -388,23 +389,22 @@ func TestIsSafeRetryablePostgresError(t *testing.T) {
 }
 
 func TestIsRetryablePostgresPreCommitError(t *testing.T) {
-	// Leg 1: driver.ErrBadConn (fn-path signal — pgx stdlib adapter converts
-	// SafeToRetry Exec/Query errors to this).
+	// isRetryablePostgresPreCommitError is an OPT-OUT classifier: pre-commit
+	// retrying is always safe (the transaction rolls back), so it retries
+	// everything EXCEPT context.Canceled/DeadlineExceeded and the permanent
+	// SQLSTATE classes (22xxx, 23xxx, 42xxx).
+
+	// Retried: pre-send guarantees.
 	require.True(t, isRetryablePostgresPreCommitError(driver.ErrBadConn))
 	require.True(t, isRetryablePostgresPreCommitError(fmt.Errorf("wrapped: %w", driver.ErrBadConn)))
-
-	// Leg 2: pgconn.SafeToRetry-flagged — pgx guarantees these ALWAYS occur
-	// before any data is sent to the server.
 	require.True(t, isRetryablePostgresPreCommitError(&safeToRetryErr{msg: "pre-send"}))
 
-	// Leg 3: isSafeRetryablePostgresError SQLSTATE codes that guarantee rollback.
+	// Retried: known-transient SQLSTATE codes (server rolled back).
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "40001"})) // serialization_failure
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "40P01"})) // deadlock_detected
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "57P01"})) // admin_shutdown
 
-	// Leg 4: isPostgresNetworkError (typed network errors — safe pre-commit
-	// because the server rolls back the uncommitted tx). NOT in
-	// isSafeRetryablePostgresError (unsafe without a tx).
+	// Retried: typed network errors (non-PgError -> retry under opt-out).
 	require.True(t, isRetryablePostgresPreCommitError(io.EOF))
 	require.True(t, isRetryablePostgresPreCommitError(io.ErrUnexpectedEOF))
 	require.True(t, isRetryablePostgresPreCommitError(&net.OpError{
@@ -412,10 +412,31 @@ func TestIsRetryablePostgresPreCommitError(t *testing.T) {
 		Err: errors.New("connection reset by peer"),
 	}))
 
-	// Non-retryable: application errors and context cancellation.
-	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "23505"})) // unique_violation
-	require.False(t, isRetryablePostgresPreCommitError(errors.New("some application error")))
+	// Retried (opt-out): an UNKNOWN *pgconn.PgError code is retried because
+	// pre-commit it's safe and we'd rather not miss a transient error we
+	// haven't enumerated. XX000 (internal_error) is not in the permanent
+	// blocklist, so it's retried.
+	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "XX000"})) // internal_error (unknown/transient)
+
+	// Retried (opt-out): a non-PgError, non-network error is retried. fn might
+	// return a wrapped error; pre-commit retrying is safe, and the cost of a
+	// false positive (200ms wasted on a permanent error) is less than the cost
+	// of a false negative (spurious user-facing failure).
+	require.True(t, isRetryablePostgresPreCommitError(errors.New("some application error")))
+
+	// NOT retried: permanent SQLSTATE classes (would fail again on retry).
+	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "23505"})) // 23xxx unique_violation
+	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "23503"})) // 23xxx foreign_key_violation
+	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "22001"})) // 22xxx string_data_right_truncation
+	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "42601"})) // 42xxx syntax_error
+	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "42501"})) // 42xxx insufficient_privilege
+	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "42P01"})) // 42xxx undefined_table
+	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "42703"})) // 42xxx undefined_column
+
+	// NOT retried: caller's context is done.
 	require.False(t, isRetryablePostgresPreCommitError(context.Canceled))
+	require.False(t, isRetryablePostgresPreCommitError(context.DeadlineExceeded))
+	require.False(t, isRetryablePostgresPreCommitError(nil))
 }
 
 func TestRetryMySQLTxNotImplemented(t *testing.T) {
