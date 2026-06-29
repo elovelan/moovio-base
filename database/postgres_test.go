@@ -2,9 +2,7 @@ package database_test
 
 import (
 	"context"
-	"errors"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -182,61 +180,6 @@ func Test_Postgres_Alloy_Migrations(t *testing.T) {
 	db, err := database.NewAndMigrate(context.Background(), log.NewDefaultLogger(), config, database.WithEmbeddedMigrations(base.PostgresMigrations))
 	require.NoError(t, err)
 	defer db.Close()
-}
-
-func TestIsRetryablePostgresError(t *testing.T) {
-	// nil error is not retryable
-	require.False(t, database.IsRetryablePostgresError(nil))
-
-	// admin_shutdown is retryable (seen during AlloyDB maintenance)
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "57P01"}))
-
-	// crash_shutdown is retryable
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "57P02"}))
-
-	// cannot_connect_now is retryable
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "57P03"}))
-
-	// serialization_failure and deadlock_detected are retryable (server rolled back)
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "40001"}))
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "40P01"}))
-
-	// too_many_connections is retryable (rejected at connect time)
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "53300"}))
-
-	// query_canceled is retryable (server rolled back the transaction)
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "57014"}))
-
-	// unique_violation is NOT retryable (application-level error)
-	require.False(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "23505"}))
-
-	// syntax_error is NOT retryable
-	require.False(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "42601"}))
-
-	// Network errors (EOF, net.OpError) are NOT retryable here: without an
-	// explicit transaction there is no way to know whether the error occurred
-	// before or after the server accepted the query, so retrying could
-	// duplicate committed work. Use RetryPostgresTx (whose classifier adds
-	// network errors back in) for transactional retry.
-	require.False(t, database.IsRetryablePostgresError(io.EOF))
-	require.False(t, database.IsRetryablePostgresError(io.ErrUnexpectedEOF))
-	require.False(t, database.IsRetryablePostgresError(&net.OpError{
-		Op:  "read",
-		Err: errors.New("connection reset by peer"),
-	}))
-
-	// String-matched connection errors are NOT retryable: string matching is
-	// fragile, and the typed checks above (plus driver.ErrBadConn and
-	// pgconn.SafeToRetry in the transactional classifier) cover the real cases.
-	require.False(t, database.IsRetryablePostgresError(errors.New("connection reset by peer")))
-	require.False(t, database.IsRetryablePostgresError(errors.New("broken pipe")))
-	require.False(t, database.IsRetryablePostgresError(errors.New("conn closed")))
-
-	// context.DeadlineExceeded is NOT retryable
-	require.False(t, database.IsRetryablePostgresError(context.DeadlineExceeded))
-
-	// Random application error is NOT retryable
-	require.False(t, database.IsRetryablePostgresError(errors.New("invalid input")))
 }
 
 func TestRetryUnsafe(t *testing.T) {
