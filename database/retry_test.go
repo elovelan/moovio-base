@@ -351,6 +351,18 @@ func TestRetryPostgresTx(t *testing.T) {
 }
 
 func TestIsSafeRetryablePostgresError(t *testing.T) {
+	// isSafeRetryablePostgresError is the "safe to retry at any phase"
+	// classifier — pre-send guarantees + server-rolled-back SQLSTATE codes.
+	// It is used directly as the commit-phase classifier for RetryPostgresTx
+	// and as the foundation of the pre-commit classifier.
+
+	// Pre-send: driver.ErrBadConn (pgx stdlib adapter only produces this for
+	// SafeToRetry-flagged Exec/Query errors) and pgconn.SafeToRetry-flagged
+	// errors. Safe at any phase because the operation never reached the server.
+	require.True(t, isSafeRetryablePostgresError(driver.ErrBadConn))
+	require.True(t, isSafeRetryablePostgresError(fmt.Errorf("wrapped: %w", driver.ErrBadConn)))
+	require.True(t, isSafeRetryablePostgresError(&safeToRetryErr{msg: "pre-send"}))
+
 	// SQLSTATE codes that the server guarantees were rolled back.
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P01"})) // admin_shutdown
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P02"})) // crash_shutdown
@@ -360,11 +372,13 @@ func TestIsSafeRetryablePostgresError(t *testing.T) {
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "53300"})) // too_many_connections
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57014"})) // query_canceled
 
-	// Application errors are not retryable.
+	// Permanent application errors are not retryable (would fail again).
 	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "23505"})) // unique_violation
 	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "42601"})) // syntax_error
 
-	// Network errors are NOT retryable here (unsafe without a transaction).
+	// Network errors are NOT retryable here: without a transaction there's no
+	// way to know if the query landed, and at commit time a network error
+	// could mean the commit succeeded but the response was lost (ErrCommitPhase).
 	require.False(t, isSafeRetryablePostgresError(nil))
 	require.False(t, isSafeRetryablePostgresError(io.EOF))
 	require.False(t, isSafeRetryablePostgresError(io.ErrUnexpectedEOF))
@@ -402,36 +416,6 @@ func TestIsRetryablePostgresPreCommitError(t *testing.T) {
 	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "23505"})) // unique_violation
 	require.False(t, isRetryablePostgresPreCommitError(errors.New("some application error")))
 	require.False(t, isRetryablePostgresPreCommitError(context.Canceled))
-}
-
-func TestIsRetryablePostgresCommitError(t *testing.T) {
-	// The commit classifier is NARROWER than the pre-commit classifier: a
-	// commit-phase error may mean the commit already succeeded, so only
-	// errors that GUARANTEE the commit did not happen are retryable here.
-
-	// Retryable at commit: pre-send guarantees.
-	require.True(t, isRetryablePostgresCommitError(driver.ErrBadConn))
-	require.True(t, isRetryablePostgresCommitError(&safeToRetryErr{msg: "pre-send commit"}))
-
-	// Retryable at commit: server-rolled-back SQLSTATE codes (e.g. 40001
-	// serialization_failure raised at commit time — server rolled back).
-	require.True(t, isRetryablePostgresCommitError(&pgconn.PgError{Code: "40001"}))
-	require.True(t, isRetryablePostgresCommitError(&pgconn.PgError{Code: "40P01"}))
-
-	// NOT retryable at commit: network errors could mean the commit succeeded
-	// but the response was lost. These are returned to the caller wrapped with
-	// ErrCommitPhase (see TestRetryPostgresTx/commit-phase_network_error).
-	require.False(t, isRetryablePostgresCommitError(io.EOF))
-	require.False(t, isRetryablePostgresCommitError(io.ErrUnexpectedEOF))
-	require.False(t, isRetryablePostgresCommitError(&net.OpError{
-		Op:  "read",
-		Err: errors.New("connection reset by peer"),
-	}))
-
-	// NOT retryable at commit: application errors.
-	require.False(t, isRetryablePostgresCommitError(&pgconn.PgError{Code: "23505"})) // unique_violation
-	require.False(t, isRetryablePostgresCommitError(errors.New("some application error")))
-	require.False(t, isRetryablePostgresCommitError(context.Canceled))
 }
 
 func TestRetryMySQLTxNotImplemented(t *testing.T) {
