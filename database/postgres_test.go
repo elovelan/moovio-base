@@ -2,11 +2,14 @@ package database_test
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/moov-io/base"
 	"github.com/moov-io/base/database"
 	"github.com/moov-io/base/database/testdb"
@@ -178,6 +181,82 @@ func Test_Postgres_Alloy_Migrations(t *testing.T) {
 	db, err := database.NewAndMigrate(context.Background(), log.NewDefaultLogger(), config, database.WithEmbeddedMigrations(base.PostgresMigrations))
 	require.NoError(t, err)
 	defer db.Close()
+}
+
+func TestRetryIdempotent(t *testing.T) {
+	t.Run("succeeds on first attempt", func(t *testing.T) {
+		calls := 0
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{}, func() error {
+			calls++
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, 1, calls)
+	})
+
+	t.Run("retries on any error by default, including non-Pg-retryable ones", func(t *testing.T) {
+		// unique_violation is NOT retryable per IsRetryablePostgresError, but
+		// RetryIdempotent's default predicate retries any error except context
+		// cancellation because the caller has vouched that fn is idempotent.
+		calls := 0
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{}, func() error {
+			calls++
+			if calls < 3 {
+				return &pgconn.PgError{Code: pgerrcode.UniqueViolation}
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, 3, calls)
+	})
+
+	t.Run("custom IsRetryable short-circuits non-retryable errors", func(t *testing.T) {
+		calls := 0
+		neverRetry := func(error) bool { return false }
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{IsRetryable: neverRetry}, func() error {
+			calls++
+			return io.EOF
+		})
+		require.Error(t, err)
+		require.Equal(t, 1, calls)
+		require.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("does not retry context cancellation by default", func(t *testing.T) {
+		calls := 0
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{}, func() error {
+			calls++
+			return context.Canceled
+		})
+		require.Error(t, err)
+		require.Equal(t, 1, calls)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("respects context cancellation between attempts", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // cancel immediately
+
+		calls := 0
+		err := database.RetryIdempotent(ctx, database.RetryIdempotentOptions{}, func() error {
+			calls++
+			return io.EOF // retryable, but context is done
+		})
+		// First call happens, then context cancellation is detected before the next attempt
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, 1, calls)
+	})
+
+	t.Run("exhausts all attempts", func(t *testing.T) {
+		calls := 0
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{}, func() error {
+			calls++
+			return io.EOF
+		})
+		require.Error(t, err)
+		require.Equal(t, 3, calls)
+		require.ErrorIs(t, err, io.EOF)
+	})
 }
 
 func Test_Postgres_UniqueViolation(t *testing.T) {

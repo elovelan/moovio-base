@@ -1,7 +1,9 @@
 package database
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -40,4 +42,17 @@ func SpannerUniqueViolation(err error) bool {
 	}
 	return spanner.ErrCode(err) == codes.AlreadyExists ||
 		strings.Contains(err.Error(), "AlreadyExists")
+}
+
+// RetrySpannerNonIdempotent is the Spanner equivalent of RetryPostgresNonIdempotent.
+// TODO: consider delegating to spannerdriver.RunTransactionWithOptions for
+// ABORTED replay, plus network retry. retryTx already handles the loop and
+// driver.ErrBadConn; the missing piece is a Spanner-specific retryClassifier.
+// See https://pkg.go.dev/github.com/googleapis/go-sql-spanner
+func RetrySpannerNonIdempotent(ctx context.Context, db *sql.DB, opts RetryNonIdempotentOptions, fn func(*sql.Tx) error) error {
+	_ = ctx
+	_ = db
+	_ = opts
+	_ = fn
+	return errors.New("database: RetrySpannerNonIdempotent is not yet implemented; see TODO")
 }

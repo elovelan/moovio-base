@@ -245,3 +245,16 @@ func MySQLDeadlockFound(err error) bool {
 
 	return strings.Contains(err.Error(), fmt.Sprintf("Error %d", mysqlErrDeadlockFound))
 }
+
+// RetryMySQLNonIdempotent is the MySQL equivalent of RetryPostgresNonIdempotent.
+// TODO: implement a MySQL-specific retryClassifier (retryTx already handles the
+// Begin/fn/Commit/Rollback loop and driver.ErrBadConn). Cover 1213 deadlock,
+// 1205 lock wait timeout, 2013 connection lost. See
+// https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html
+func RetryMySQLNonIdempotent(ctx context.Context, db *sql.DB, opts RetryNonIdempotentOptions, fn func(*sql.Tx) error) error {
+	_ = ctx
+	_ = db
+	_ = opts
+	_ = fn
+	return errors.New("database: RetryMySQLNonIdempotent is not yet implemented; see TODO")
+}

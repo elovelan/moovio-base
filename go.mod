@@ -14,6 +14,7 @@ require (
 	github.com/googleapis/gax-go/v2 v2.22.0
 	github.com/googleapis/go-sql-spanner v1.25.1
 	github.com/gorilla/mux v1.8.1
+	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/madflojo/testcerts v1.5.0
 	github.com/markbates/pkger v0.17.1

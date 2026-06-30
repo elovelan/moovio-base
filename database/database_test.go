@@ -5,13 +5,17 @@ package database_test
 
 import (
 	"bytes"
+	"database/sql"
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/moov-io/base/database"
+	"github.com/moov-io/base/log"
 
 	"github.com/stretchr/testify/require"
 )
@@ -35,7 +39,7 @@ func TestUniqueViolation(t *testing.T) {
 		t.Error("should have matched postgres unique violation")
 	}
 	pgconnErr := &pgconn.PgError{
-		Code: "23505",
+		Code: pgerrcode.UniqueViolation,
 	}
 	if !database.UniqueViolation(pgconnErr) {
 		t.Error("should have matched PgError unique violation")
@@ -75,7 +79,7 @@ func TestDeadlockFound(t *testing.T) {
 		t.Error("should have matched postgres deadlock found")
 	}
 	pgconnErr := &pgconn.PgError{
-		Code: "40P01",
+		Code: pgerrcode.DeadlockDetected,
 	}
 	if !database.DeadlockFound(pgconnErr) {
 		t.Error("should have matched PgError deadlock found")
@@ -119,6 +123,52 @@ func TestDataTooLong(t *testing.T) {
 	if database.DataTooLong(gomysqlErr) {
 		t.Error("should not have matched go mysql driver data too long")
 	}
+}
+
+func TestApplyPostgresConnectionsConfig_Defaults(t *testing.T) {
+	// When no config values are set, defaults should be applied
+	db, err := sql.Open("txdb", "TestApplyPostgresConnectionsConfig_Defaults")
+	if err != nil {
+		t.Skip("skipping test without txdb driver")
+	}
+	defer db.Close()
+
+	connections := &database.ConnectionsConfig{}
+	database.ApplyPostgresConnectionsConfig(db, connections, log.NewTestLogger())
+
+	defaults := database.DefaultPostgresConnectionsConfig()
+	stats := db.Stats()
+	require.Equal(t, defaults.MaxOpen, stats.MaxOpenConnections)
+}
+
+func TestApplyPostgresConnectionsConfig_Overrides(t *testing.T) {
+	// When config values are set, they should override defaults
+	db, err := sql.Open("txdb", "TestApplyPostgresConnectionsConfig_Overrides")
+	if err != nil {
+		t.Skip("skipping test without txdb driver")
+	}
+	defer db.Close()
+
+	connections := &database.ConnectionsConfig{
+		MaxOpen:     10,
+		MaxIdle:     3,
+		MaxLifetime: time.Minute,
+		MaxIdleTime: time.Second * 15,
+	}
+	database.ApplyPostgresConnectionsConfig(db, connections, log.NewTestLogger())
+
+	stats := db.Stats()
+	require.Equal(t, 10, stats.MaxOpenConnections)
+}
+
+func TestDefaultPostgresConnectionsConfig(t *testing.T) {
+	defaults := database.DefaultPostgresConnectionsConfig()
+	require.Greater(t, defaults.MaxOpen, 0)
+	require.Greater(t, defaults.MaxIdle, 0)
+	require.Greater(t, defaults.MaxLifetime, time.Duration(0))
+	require.Greater(t, defaults.MaxIdleTime, time.Duration(0))
+	// MaxIdleTime should be shorter than MaxLifetime
+	require.Less(t, defaults.MaxIdleTime, defaults.MaxLifetime)
 }
 
 func TestConnectionsConfigOrder(t *testing.T) {
