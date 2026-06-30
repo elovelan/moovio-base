@@ -263,9 +263,15 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 		require.Equal(t, 2, d.beginCalls) // first Begin failed, second succeeded
 	})
 
-	t.Run("SafeToRetry-flagged Commit failure is retried", func(t *testing.T) {
+	t.Run("SafeToRetry-flagged Commit failure is verified-aborted and retried", func(t *testing.T) {
+		// A SafeToRetry-flagged commit error (pre-send) for a write transaction
+		// is now verified (not fast-pathed): pg_xact_status says aborted (the
+		// COMMIT never sent, so the tx didn't commit) → retry → second attempt
+		// succeeds.
 		d := &mockDriver{
-			commitErrs: []error{&safeToRetryErr{msg: "pre-send commit failure"}},
+			captureXidResult:   "1", // write transaction
+			verifyStatusResult: "aborted",
+			commitErrs:         []error{&safeToRetryErr{msg: "pre-send commit failure"}},
 		}
 		db := newMockDB(d)
 		defer db.Close()
@@ -277,8 +283,8 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 		})
 		require.NoError(t, err)
 		require.Equal(t, 2, calls)
-		require.Equal(t, 2, d.beginCalls)
-		require.Equal(t, 2, d.commitCalls) // first commit failed, second succeeded
+		require.Equal(t, 2, d.commitCalls)
+		require.Equal(t, 1, d.verifyCalls) // verified once (first attempt's commit)
 	})
 
 	t.Run("commit-phase network error with inconclusive verification is wrapped with ErrCommitPhase", func(t *testing.T) {
@@ -426,14 +432,13 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 	})
 
 	t.Run("commit-phase class-40 exhaustion returns the original error (not ErrCommitPhase)", func(t *testing.T) {
-		// serialization_failure (class 40) at commit is retryable per the commit
-		// classifier (server rolled back → known non-commit). Retried until
-		// exhausted; the original error is returned (NOT ErrCommitPhase — it's
-		// not ambiguous, and verification isn't consulted for classifier-
-		// retryable commit errors).
+		// serialization_failure (class 40) at commit: the server rolled back,
+		// so pg_xact_status says aborted → retry. Retried until exhausted; the
+		// original error is returned (NOT ErrCommitPhase — it's known
+		// non-commit, just out of retries).
 		d := &mockDriver{
 			captureXidResult:   "1",
-			verifyStatusResult: "aborted", // unused — classifier says retryable, verify not called
+			verifyStatusResult: "aborted", // server rolled back → aborted → retry each time
 			commitErrs: []error{
 				&pgconn.PgError{Code: pgerrcode.SerializationFailure},
 				&pgconn.PgError{Code: pgerrcode.SerializationFailure},
@@ -451,7 +456,7 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, 3, calls)
 		require.Equal(t, 3, d.commitCalls)
-		require.Equal(t, 0, d.verifyCalls) // classifier-retryable → no verification
+		require.Equal(t, 3, d.verifyCalls) // verified each attempt (always-verify)
 		require.NotErrorIs(t, err, ErrCommitPhase) // known non-commit, not ambiguous
 		var pgErr *pgconn.PgError
 		require.ErrorAs(t, err, &pgErr)
@@ -520,39 +525,6 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 		require.Equal(t, 0, d.commitCalls) // fn always errors, so no commit
 		require.Equal(t, 3, d.rollbackCalls)
 	})
-}
-
-func TestIsSafeRetryablePostgresError(t *testing.T) {
-	// Commit-phase classifier (maximally conservative): only errors that can
-	// NEVER mean "possibly committed" — pgconn.SafeToRetry (pre-send) and
-	// class 40 (server rolled back before the ErrorResponse). Everything else
-	// is excluded → wrapped with ErrCommitPhase. See doc.
-
-	require.True(t, isSafeRetryablePostgresError(&safeToRetryErr{msg: "pre-send commit"})) // SafeToRetry-flagged
-
-	// Class 40 (Transaction Rollback) — server rolled back before returning.
-	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.SerializationFailure}))
-	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.DeadlockDetected}))
-	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.TransactionRollback}))
-	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.TransactionIntegrityConstraintViolation}))
-
-	// Excluded (could mean "possibly committed" → ErrCommitPhase at commit).
-	require.False(t, isSafeRetryablePostgresError(driver.ErrBadConn)) // not seen at commit (pgx Commit returns native errors)
-	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.AdminShutdown}))     // die() can interrupt after commit recorded
-	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.CrashShutdown}))    // quickdie() _exit(2) without rollback
-	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.CannotConnectNow})) // connect-time, not a commit error
-	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.TooManyConnections}))
-	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.QueryCanceled})) // cancel-after-commit edge case
-
-	// Permanent + network + context errors not retryable here.
-	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.UniqueViolation}))
-	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: pgerrcode.SyntaxError}))
-	require.False(t, isSafeRetryablePostgresError(nil))
-	require.False(t, isSafeRetryablePostgresError(io.EOF))
-	require.False(t, isSafeRetryablePostgresError(io.ErrUnexpectedEOF))
-	require.False(t, isSafeRetryablePostgresError(&net.OpError{Op: "read", Err: errors.New("connection reset by peer")}))
-	require.False(t, isSafeRetryablePostgresError(context.Canceled))
-	require.False(t, isSafeRetryablePostgresError(errors.New("some application error")))
 }
 
 func TestIsRetryablePostgresPreCommitError(t *testing.T) {

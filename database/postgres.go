@@ -170,49 +170,6 @@ func PostgresDeadlockFound(err error) bool {
 	return strings.Contains(err.Error(), pgerrcode.DeadlockDetected)
 }
 
-// isSafeRetryablePostgresError is the commit-phase classifier for
-// RetryPostgresNonIdempotent: true iff the error guarantees the commit didn't happen, so
-// retry is safe even at commit. Maximally conservative — only errors that can
-// NEVER mean "possibly committed":
-//
-//	- pgconn.SafeToRetry: pgx guarantees the error occurred before any data
-//	  was sent to the server (COMMIT message never sent).
-//	- pgerrcode.IsTransactionRollback: class 40 SQLSTATE codes (40001
-//	  serialization_failure, 40P01 deadlock_detected, 40002, 40003, 40000) —
-//	  the server rolled back the transaction before returning the ErrorResponse.
-//	  See https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html
-//
-// Excluded (could mean "possibly committed" → wrapped with ErrCommitPhase):
-//	- 57P01 admin_shutdown, 57P02 crash_shutdown: die()/quickdie() are signal
-//	  handlers that can interrupt after the commit is recorded but before the
-//	  response is sent. quickdie() also skips rollback (_exit(2)).
-//	- 57014 query_canceled: a cancel arriving after the commit records is a
-//	  theoretical edge case.
-//	- 57P03/53300: connect-time, won't surface from Commit.
-//	- network errors: could mean commit succeeded but the response was lost.
-//	- driver.ErrBadConn: pgx's Commit returns native errors (the ErrBadConn
-//	  conversion is only in Exec/Query), so the commit path never sees it;
-//	  pre-send commit is covered by pgconn.SafeToRetry. *sql.Tx.Commit doesn't
-//	  retry ErrBadConn internally (only *sql.DB methods do).
-//
-// Everything excluded here is still retried pre-commit via
-// isRetryablePostgresPreCommitError's opt-out (the tx didn't commit pre-commit).
-//
-// Unexported: use RetryPostgresNonIdempotent or RetryIdempotent rather than building on this.
-func isSafeRetryablePostgresError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if pgconn.SafeToRetry(err) {
-		return true
-	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgerrcode.IsTransactionRollback(pgErr.Code)
-	}
-	return false
-}
-
 // isPermanentPostgresError reports SQLSTATE classes that would fail again on
 // retry, used by isRetryablePostgresPreCommitError to opt out. Only
 // clearly-permanent classes are listed so unknown/transient codes are retried.
@@ -305,14 +262,15 @@ func verifyPostgresCommit(ctx context.Context, db retryDB, xid any) (commitStatu
 // whole transaction on transient errors. fn gets a fresh *sql.Tx each attempt;
 // if it returns an error the tx is rolled back, if nil the tx is committed.
 //
-// Pre-commit errors use the opt-out isRetryablePostgresPreCommitError; commit
-// errors use the narrower opt-in isSafeRetryablePostgresError. Commit-phase
-// errors the commit classifier rejects are verified: before each Commit the
-// transaction id is captured (pg_current_xact_id_if_assigned), and on an
-// ambiguous commit error pg_xact_status is queried on a fresh connection —
-// aborted → retry, committed → ErrCommitted (don't retry), inconclusive →
-// ErrCommitPhase. Read-only transactions (no xid) retry without verification.
-// opts.IsRetryable is additive on both classifiers.
+// Pre-commit errors (from BeginTx or fn) use the opt-out
+// isRetryablePostgresPreCommitError (opts.IsRetryable is additive on it).
+// Commit errors are always verified: before each Commit the transaction id is
+// captured (pg_current_xact_id_if_assigned), and on a commit error
+// pg_xact_status is queried on a fresh connection — aborted → retry,
+// committed → ErrCommitted (don't retry), inconclusive → ErrCommitPhase.
+// Read-only transactions (no xid) retry without verification. No client-side
+// "retryable commit" guess — the server is the authority on whether the commit
+// landed.
 //
 // db must be pgx-backed (e.g. from database.New with a PostgresConfig); other
 // drivers won't get pgx-specific retries or commit verification.
@@ -320,12 +278,11 @@ func RetryPostgresNonIdempotent(ctx context.Context, db *sql.DB, opts RetryNonId
 	return retryTx(ctx, db, postgresTxClassifier, opts, fn)
 }
 
-// postgresTxClassifier pairs the pre-commit (opt-out) and commit (opt-in)
-// classifiers with commit verification (capturePostgresXid/verifyPostgresCommit).
-// See ErrCommitPhase / ErrCommitted.
+// postgresTxClassifier pairs the pre-commit (opt-out) classifier with commit
+// verification (capturePostgresXid/verifyPostgresCommit). Commit errors are
+// always verified, not classified. See ErrCommitPhase / ErrCommitted.
 var postgresTxClassifier = retryClassifier{
 	preCommit:    isRetryablePostgresPreCommitError,
-	commit:       isSafeRetryablePostgresError,
 	captureXid:   capturePostgresXid,
 	verifyCommit: verifyPostgresCommit,
 }

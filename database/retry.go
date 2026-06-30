@@ -14,8 +14,9 @@ import (
 type RetryNonIdempotentOptions struct {
 	// TxOptions passed to (*sql.DB).BeginTx each attempt; nil = default isolation.
 	TxOptions *sql.TxOptions
-	// IsRetryable, if non-nil, is OR'd with the backend's default classifier
-	// (both phases). Be careful adding cases unsafe at commit (see ErrCommitPhase).
+	// IsRetryable, if non-nil, is OR'd with the backend's pre-commit classifier
+	// (errors from BeginTx or fn). Commit errors are always verified via
+	// pg_xact_status, not classified, so IsRetryable does not affect them.
 	IsRetryable func(err error) bool
 }
 
@@ -72,30 +73,22 @@ type retryDB interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// retryClassifier holds per-phase classifiers and optional commit-verification
-// hooks. preCommit classifies BeginTx/fn errors; commit classifies
-// (*sql.Tx).Commit errors (must be narrower — a commit-phase error may mean
-// the commit already succeeded). captureXid/verifyCommit enable commit
-// verification for ambiguous commit errors (see ErrCommitPhase/ErrCommitted).
+// retryClassifier holds the pre-commit classifier and optional commit-
+// verification hooks. preCommit classifies BeginTx/fn errors (opt-out: pre-
+// commit retry is always safe — the transaction rolls back). Commit errors are
+// not classified; they're always verified via captureXid/verifyCommit (a commit
+// error may mean the commit already succeeded, so the server is the authority,
+// not a client-side guess). See ErrCommitPhase/ErrCommitted.
 type retryClassifier struct {
 	preCommit func(error) bool
-	commit    func(error) bool
 	// captureXid, if non-nil, is called after fn succeeds and before Commit to
 	// capture a transaction identifier for verifyCommit. Returns nil if the
 	// transaction has no id (e.g. read-only — safe to retry without verifying).
 	captureXid func(*sql.Tx) (any, error)
-	// verifyCommit, if non-nil, is called on a commit-phase error the commit
-	// classifier rejected, to check whether the commit landed. Runs on a fresh
-	// connection (db) since the original may be dead. xid is from captureXid.
+	// verifyCommit, if non-nil, is called on every commit error (with the xid
+	// from captureXid) to check whether the commit landed. Runs on a fresh
+	// connection (db) since the original may be dead.
 	verifyCommit func(ctx context.Context, db retryDB, xid any) (commitStatus, error)
-}
-
-// classify picks the commit classifier when commitPhase, else preCommit.
-func (c retryClassifier) classify(err error, commitPhase bool) bool {
-	if commitPhase {
-		return c.commit(err)
-	}
-	return c.preCommit(err)
 }
 
 // RetryIdempotent runs fn up to maxRetryAttempts times, retrying on any error
@@ -133,25 +126,29 @@ func isRetryableUnsafeDefault(err error) bool {
 }
 
 // retryTx is the shared retry loop for RetryPostgresNonIdempotent (and future
-// MySQL/Spanner implementations). opts.IsRetryable is OR'd with base on both
-// phases. Commit-phase errors the commit classifier rejects are verified via
-// base.verifyCommit when an xid was captured: verified-aborted → retry,
-// verified-committed → ErrCommitted (don't retry), inconclusive → ErrCommitPhase.
-// Read-only transactions (no xid) retry without verification (no writes to
-// duplicate). Commit-phase errors the classifier accepts (class 40: server
-// rolled back) are retried; on exhaustion they return the original error (not
-// ErrCommitPhase — they're known non-commit).
+// MySQL/Spanner implementations). opts.IsRetryable is OR'd with base.preCommit
+// (pre-commit errors only — commit errors are always verified, not classified).
+//
+// Pre-commit errors (from BeginTx or fn): retryable per preCommit (opt-out —
+// the transaction rolls back, so retry is always safe).
+//
+// Commit errors (from (*sql.Tx).Commit): always verified via verifyCommit when
+// an xid was captured — verified-aborted → retry, verified-committed →
+// ErrCommitted (don't retry), inconclusive → ErrCommitPhase. Read-only
+// transactions (no xid) retry without verifying (no writes to duplicate). A
+// retryable commit error (aborted/read-only) on exhaustion returns the original
+// error, not ErrCommitPhase (it's known non-commit); only inconclusive commits
+// get ErrCommitPhase.
 //
 // database/sql already retries driver.ErrBadConn for *sql.DB methods (immediate,
 // up to 3 attempts) before surfacing it; this outer loop layers on top with
 // jitter for longer outages. *sql.Tx methods have no internal retry, so this is
 // the only retry for tx.Exec/tx.Commit.
 func retryTx(ctx context.Context, db retryDB, base retryClassifier, opts RetryNonIdempotentOptions, fn func(*sql.Tx) error) error {
-	classifier := base
+	preCommit := base.preCommit
 	if opts.IsRetryable != nil {
 		extra := opts.IsRetryable
-		classifier.preCommit = func(err error) bool { return base.preCommit(err) || extra(err) }
-		classifier.commit = func(err error) bool { return base.commit(err) || extra(err) }
+		preCommit = func(err error) bool { return base.preCommit(err) || extra(err) }
 	}
 	var lastErr error
 	var lastCommitPhase bool
@@ -164,14 +161,18 @@ func retryTx(ctx context.Context, db retryDB, base retryClassifier, opts RetryNo
 		if lastErr == nil {
 			return nil
 		}
-		retryable := classifier.classify(lastErr, commitPhase)
-		if !retryable && commitPhase {
-			// Commit-phase error the classifier rejected — verify whether the
-			// commit landed, if we captured an xid and have a verifier.
+		var retryable bool
+		if !commitPhase {
+			// Pre-commit error: opt-out classifier decides.
+			retryable = preCommit(lastErr)
+		} else {
+			// Commit error: always verify whether the commit landed (the server
+			// is the authority — a client-side guess can't tell committed-but-
+			// response-lost from genuinely-aborted).
 			switch {
 			case base.captureXid != nil && xid == nil:
-				// Read-only transaction (no xid assigned): no writes to
-				// duplicate, so retry is safe without verification.
+				// Read-only transaction (no xid): no writes to duplicate, retry
+				// is safe without verification.
 				retryable = true
 			case base.verifyCommit != nil && xid != nil:
 				switch status, verr := base.verifyCommit(ctx, db, xid); {
@@ -182,6 +183,8 @@ func retryTx(ctx context.Context, db retryDB, base retryClassifier, opts RetryNo
 				default: // commitStatusUnknown or verification error → ambiguous
 					retryable = false
 				}
+			default:
+				retryable = false // no verifier → ambiguous (ErrCommitPhase)
 			}
 		}
 		lastRetryable = retryable
@@ -192,9 +195,9 @@ func retryTx(ctx context.Context, db retryDB, base retryClassifier, opts RetryNo
 			return ctx.Err()
 		}
 	}
-	// A retryable commit-phase error (class-40 rolled back, verified-aborted,
-	// or read-only) is known non-commit, so on exhaustion return the original
-	// error — not ErrCommitPhase (which is only for inconclusive commits).
+	// A retryable commit error (verified-aborted or read-only) is known
+	// non-commit, so on exhaustion return the original error — not ErrCommitPhase
+	// (which is only for inconclusive commits).
 	if lastCommitPhase && !lastRetryable {
 		return fmt.Errorf("%w: %w", ErrCommitPhase, lastErr)
 	}
