@@ -27,7 +27,7 @@ func postgresConnection(ctx context.Context, logger log.Logger, config PostgresC
 	// that exceeded MaxConnLifetime or MaxConnIdleTime. It does NOT ping for
 	// liveness — dead connections are caught at acquire time by the ResetSession
 	// ping (default: ping if idle > 1s), with database/sql retrying on a fresh
-	// conn and RetryPostgresTx retrying beyond that.
+	// conn and RetryPostgresNonIdempotent retrying beyond that.
 	poolConfig.HealthCheckPeriod = 1 * time.Second
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
@@ -171,7 +171,7 @@ func PostgresDeadlockFound(err error) bool {
 }
 
 // isSafeRetryablePostgresError is the commit-phase classifier for
-// RetryPostgresTx: true iff the error guarantees the commit didn't happen, so
+// RetryPostgresNonIdempotent: true iff the error guarantees the commit didn't happen, so
 // retry is safe even at commit. Maximally conservative — only errors that can
 // NEVER mean "possibly committed":
 //
@@ -198,7 +198,7 @@ func PostgresDeadlockFound(err error) bool {
 // Everything excluded here is still retried pre-commit via
 // isRetryablePostgresPreCommitError's opt-out (the tx didn't commit pre-commit).
 //
-// Unexported: use RetryPostgresTx or RetryUnsafe rather than building on this.
+// Unexported: use RetryPostgresNonIdempotent or RetryIdempotent rather than building on this.
 func isSafeRetryablePostgresError(err error) bool {
 	if err == nil {
 		return false
@@ -231,7 +231,7 @@ func isPermanentPostgresError(pgErr *pgconn.PgError) bool {
 const retryJitterMax = 100 * time.Millisecond
 
 // isRetryablePostgresPreCommitError is the pre-commit classifier for
-// RetryPostgresTx (errors from BeginTx or fn). OPTS OUT: pre-commit retry is
+// RetryPostgresNonIdempotent (errors from BeginTx or fn). OPTS OUT: pre-commit retry is
 // always safe (the transaction rolls back), so it retries everything EXCEPT
 // context.Canceled/DeadlineExceeded and the permanent SQLSTATE classes
 // (isPermanentPostgresError). Unknown *pgconn.PgError codes and non-PgError
@@ -255,7 +255,7 @@ func isRetryablePostgresPreCommitError(err error) bool {
 	return true
 }
 
-// RetryPostgresTx runs fn in a Postgres transaction, retrying the whole
+// RetryPostgresNonIdempotent runs fn in a Postgres transaction, retrying the whole
 // transaction on transient errors. fn gets a fresh *sql.Tx each attempt; if it
 // returns an error the tx is rolled back, if nil the tx is committed.
 //
@@ -266,7 +266,7 @@ func isRetryablePostgresPreCommitError(err error) bool {
 //
 // db must be pgx-backed (e.g. from database.New with a PostgresConfig); other
 // drivers won't get pgx-specific retries.
-func RetryPostgresTx(ctx context.Context, db *sql.DB, opts RetryTxOptions, fn func(*sql.Tx) error) error {
+func RetryPostgresNonIdempotent(ctx context.Context, db *sql.DB, opts RetryNonIdempotentOptions, fn func(*sql.Tx) error) error {
 	return retryTx(ctx, db, postgresTxClassifier, opts, fn)
 }
 

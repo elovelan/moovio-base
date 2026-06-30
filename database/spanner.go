@@ -44,15 +44,15 @@ func SpannerUniqueViolation(err error) bool {
 		strings.Contains(err.Error(), "AlreadyExists")
 }
 
-// RetrySpannerTx is the Spanner equivalent of RetryPostgresTx.
+// RetrySpannerNonIdempotent is the Spanner equivalent of RetryPostgresNonIdempotent.
 // TODO: consider delegating to spannerdriver.RunTransactionWithOptions for
 // ABORTED replay, plus network retry. retryTx already handles the loop and
 // driver.ErrBadConn; the missing piece is a Spanner-specific retryClassifier.
 // See https://pkg.go.dev/github.com/googleapis/go-sql-spanner
-func RetrySpannerTx(ctx context.Context, db *sql.DB, opts RetryTxOptions, fn func(*sql.Tx) error) error {
+func RetrySpannerNonIdempotent(ctx context.Context, db *sql.DB, opts RetryNonIdempotentOptions, fn func(*sql.Tx) error) error {
 	_ = ctx
 	_ = db
 	_ = opts
 	_ = fn
-	return errors.New("database: RetrySpannerTx is not yet implemented; see TODO")
+	return errors.New("database: RetrySpannerNonIdempotent is not yet implemented; see TODO")
 }

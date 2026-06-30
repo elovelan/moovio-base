@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
-// RetryTxOptions configures RetryPostgresTx (and future RetryMySQLTx/SpannerTx).
-type RetryTxOptions struct {
+// RetryNonIdempotentOptions configures RetryPostgresNonIdempotent (and future
+// RetryMySQLNonIdempotent / RetrySpannerNonIdempotent).
+type RetryNonIdempotentOptions struct {
 	// TxOptions passed to (*sql.DB).BeginTx each attempt; nil = default isolation.
 	TxOptions *sql.TxOptions
 	// IsRetryable, if non-nil, is OR'd with the backend's default classifier
@@ -18,14 +19,14 @@ type RetryTxOptions struct {
 	IsRetryable func(err error) bool
 }
 
-// RetryUnsafeOptions configures RetryUnsafe.
-type RetryUnsafeOptions struct {
+// RetryIdempotentOptions configures RetryIdempotent.
+type RetryIdempotentOptions struct {
 	// IsRetryable, if nil, retries any error except context.Canceled/DeadlineExceeded.
 	// If non-nil, replaces the default.
 	IsRetryable func(err error) bool
 }
 
-// maxRetryAttempts is the attempt count for RetryPostgresTx and RetryUnsafe
+// maxRetryAttempts is the attempt count for RetryPostgresNonIdempotent and RetryIdempotent
 // (initial + 2 retries), matching database/sql's maxBadConnRetries+1. Not
 // configurable: use the context deadline to bound total time, or wrap for more.
 const maxRetryAttempts = 3
@@ -33,7 +34,7 @@ const maxRetryAttempts = 3
 // ErrCommitPhase wraps a non-retried error from (*sql.Tx).Commit. A commit-
 // phase error is ambiguous: the commit may have succeeded before the error was
 // returned (e.g. connection severed after COMMIT sent but before the response).
-// RetryPostgresTx doesn't retry such errors (could duplicate the work) and
+// RetryPostgresNonIdempotent doesn't retry such errors (could duplicate the work) and
 // wraps them with ErrCommitPhase so the caller can detect them via errors.Is
 // and decide whether to alert/reconcile/check if the commit landed (future
 // pg_xact_status() work). The underlying error is preserved.
@@ -60,11 +61,11 @@ func (c retryClassifier) classify(err error, commitPhase bool) bool {
 	return c.preCommit(err)
 }
 
-// RetryUnsafe runs fn up to maxRetryAttempts times, retrying on any error
+// RetryIdempotent runs fn up to maxRetryAttempts times, retrying on any error
 // opts.IsRetryable says is retryable (default: any except context cancellation/
 // deadline). fn MUST be idempotent — no transaction wrapper, so a retry may
 // re-execute work that already committed.
-func RetryUnsafe(ctx context.Context, opts RetryUnsafeOptions, fn func() error) error {
+func RetryIdempotent(ctx context.Context, opts RetryIdempotentOptions, fn func() error) error {
 	isRetryable := opts.IsRetryable
 	if isRetryable == nil {
 		isRetryable = isRetryableUnsafeDefault
@@ -86,7 +87,7 @@ func RetryUnsafe(ctx context.Context, opts RetryUnsafeOptions, fn func() error) 
 }
 
 // isRetryableUnsafeDefault retries any error except context cancellation/deadline
-// (RetryUnsafe callers vouch fn is idempotent).
+// (RetryIdempotent callers vouch fn is idempotent).
 func isRetryableUnsafeDefault(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
@@ -94,7 +95,7 @@ func isRetryableUnsafeDefault(err error) bool {
 	return true
 }
 
-// retryTx is the shared retry loop for RetryPostgresTx (and future MySQL/Spanner
+// retryTx is the shared retry loop for RetryPostgresNonIdempotent (and future MySQL/Spanner
 // implementations). opts.IsRetryable is OR'd with base on both phases. Non-
 // retried commit-phase errors are wrapped with ErrCommitPhase.
 //
@@ -102,7 +103,7 @@ func isRetryableUnsafeDefault(err error) bool {
 // up to 3 attempts) before surfacing it; this outer loop layers on top with
 // jitter for longer outages. *sql.Tx methods have no internal retry, so this is
 // the only retry for tx.Exec/tx.Commit.
-func retryTx(ctx context.Context, db beginTxer, base retryClassifier, opts RetryTxOptions, fn func(*sql.Tx) error) error {
+func retryTx(ctx context.Context, db beginTxer, base retryClassifier, opts RetryNonIdempotentOptions, fn func(*sql.Tx) error) error {
 	classifier := base
 	if opts.IsRetryable != nil {
 		extra := opts.IsRetryable

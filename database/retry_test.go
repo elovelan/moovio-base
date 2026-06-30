@@ -27,7 +27,7 @@ func (e *safeToRetryErr) SafeToRetry() bool { return true }
 
 // mockConnector + mockDriver + mockConn + mockTx form a minimal
 // database/sql/driver implementation whose BeginTx/Commit/Rollback/Exec return
-// configurable, stateful error sequences. This lets RetryPostgresTx (and the
+// configurable, stateful error sequences. This lets RetryPostgresNonIdempotent (and the
 // shared retryTx helper it delegates to) be driven through a real *sql.DB
 // without a Postgres. *sql.Tx is concrete, so a mock driver is the only way
 // to control Commit/Rollback errors.
@@ -117,14 +117,14 @@ func newMockDB(d *mockDriver) *sql.DB {
 	return sql.OpenDB(&mockConnector{d: d})
 }
 
-func TestRetryPostgresTx(t *testing.T) {
+func TestRetryPostgresNonIdempotent(t *testing.T) {
 	t.Run("succeeds on first attempt", func(t *testing.T) {
 		d := &mockDriver{}
 		db := newMockDB(d)
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -140,7 +140,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			if calls < 2 {
 				return &pgconn.PgError{Code: pgerrcode.SerializationFailure}
@@ -162,7 +162,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			return &pgconn.PgError{Code: pgerrcode.UniqueViolation}
 		})
@@ -182,7 +182,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			if calls < 2 {
 				return driver.ErrBadConn
@@ -205,7 +205,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -222,7 +222,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -244,7 +244,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -268,7 +268,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -296,7 +296,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			return nil
 		})
@@ -321,7 +321,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{
 			IsRetryable: func(err error) bool { return errors.Is(err, sentinelErr) },
 		}, func(*sql.Tx) error {
 			calls++
@@ -343,7 +343,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(ctx, db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(ctx, db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			if calls == 1 {
 				cancel() // cancel after the first attempt runs
@@ -362,7 +362,7 @@ func TestRetryPostgresTx(t *testing.T) {
 		defer db.Close()
 
 		calls := 0
-		err := RetryPostgresTx(context.Background(), db, RetryTxOptions{}, func(*sql.Tx) error {
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
 			calls++
 			return &pgconn.PgError{Code: pgerrcode.DeadlockDetected}
 		})
@@ -456,14 +456,14 @@ func TestIsRetryablePostgresPreCommitError(t *testing.T) {
 	require.False(t, isRetryablePostgresPreCommitError(nil))
 }
 
-func TestRetryMySQLTxNotImplemented(t *testing.T) {
-	err := RetryMySQLTx(context.Background(), nil, RetryTxOptions{}, func(*sql.Tx) error { return nil })
+func TestRetryMySQLNonIdempotentNotImplemented(t *testing.T) {
+	err := RetryMySQLNonIdempotent(context.Background(), nil, RetryNonIdempotentOptions{}, func(*sql.Tx) error { return nil })
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "not yet implemented")
 }
 
-func TestRetrySpannerTxNotImplemented(t *testing.T) {
-	err := RetrySpannerTx(context.Background(), nil, RetryTxOptions{}, func(*sql.Tx) error { return nil })
+func TestRetrySpannerNonIdempotentNotImplemented(t *testing.T) {
+	err := RetrySpannerNonIdempotent(context.Background(), nil, RetryNonIdempotentOptions{}, func(*sql.Tx) error { return nil })
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "not yet implemented")
 }
