@@ -3,7 +3,6 @@ package database
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net"
@@ -180,9 +179,6 @@ func PostgresDeadlockFound(err error) bool {
 // occurred (the operation never reached the server, or the server rolled back
 // before returning the error). It is the OR of:
 //
-//   - errors.Is(err, driver.ErrBadConn): pgx's stdlib adapter only produces
-//     this for pgconn.SafeToRetry-flagged (pre-send) errors, so the operation
-//     never reached the server.
 //   - pgconn.SafeToRetry(err): pgx guarantees the error occurred before any
 //     data was sent to the server (e.g., during connection acquisition,
 //     conn-busy, HA NotPreferredError, pre-send timeouts).
@@ -194,6 +190,17 @@ func PostgresDeadlockFound(err error) bool {
 // The pre-commit classifier (isRetryablePostgresPreCommitError) is a separate
 // opt-out classifier that retries a broader set, because pre-commit the
 // transaction rolls back so retrying is always safe.
+//
+// driver.ErrBadConn is intentionally NOT checked here. It is produced by pgx's
+// stdlib adapter only inside Conn.ExecContext/QueryContext (i.e., from fn's
+// tx.Exec/tx.Query), NOT from wrapTx.Commit — pgx's Commit returns the native
+// pgx error directly. So the commit classifier never sees driver.ErrBadConn
+// with pgx, and the pre-send commit case is already covered by pgconn.SafeToRetry
+// above. (driver.ErrBadConn from fn's tx.Exec IS retryable, but that's a
+// pre-commit error handled by isRetryablePostgresPreCommitError's opt-out
+// catch-all.) Note also that *sql.Tx.Commit does not retry driver.ErrBadConn
+// internally — only *sql.DB methods do — so there is no database/sql retry to
+// double up with at commit time.
 //
 // Network-level errors (net.OpError, io.EOF) are intentionally NOT classified
 // here: without an explicit transaction there is no way to know whether the
@@ -207,12 +214,6 @@ func PostgresDeadlockFound(err error) bool {
 func isSafeRetryablePostgresError(err error) bool {
 	if err == nil {
 		return false
-	}
-	// driver.ErrBadConn is produced by pgx's stdlib adapter only for
-	// pgconn.SafeToRetry-flagged (pre-send) errors from Exec/Query, so the
-	// operation never reached the server. Safe to retry at any phase.
-	if errors.Is(err, driver.ErrBadConn) {
-		return true
 	}
 	// pgconn.SafeToRetry is pgx's authoritative flag for "occurred before any
 	// data was sent to the server". Covers Begin/Commit failures where the

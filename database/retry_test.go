@@ -356,13 +356,21 @@ func TestIsSafeRetryablePostgresError(t *testing.T) {
 	// commit succeeded but the response was lost — see ErrCommitPhase). The
 	// pre-commit classifier (isRetryablePostgresPreCommitError) is a separate
 	// OPT-OUT classifier that retries a broader set.
+	//
+	// driver.ErrBadConn is intentionally NOT in this classifier: pgx's
+	// wrapTx.Commit returns native pgx errors (not driver.ErrBadConn), so the
+	// commit path never sees it. The pre-send commit case is covered by
+	// pgconn.SafeToRetry below. driver.ErrBadConn from fn's tx.Exec IS
+	// retryable, but that's a pre-commit error handled by the opt-out catch-all
+	// (see TestIsRetryablePostgresPreCommitError).
 
-	// Pre-send: driver.ErrBadConn (pgx stdlib adapter only produces this for
-	// SafeToRetry-flagged Exec/Query errors) and pgconn.SafeToRetry-flagged
-	// errors. Safe at any phase because the operation never reached the server.
-	require.True(t, isSafeRetryablePostgresError(driver.ErrBadConn))
-	require.True(t, isSafeRetryablePostgresError(fmt.Errorf("wrapped: %w", driver.ErrBadConn)))
-	require.True(t, isSafeRetryablePostgresError(&safeToRetryErr{msg: "pre-send"}))
+	// Pre-send: pgconn.SafeToRetry-flagged errors. Safe at any phase because
+	// the operation never reached the server.
+	require.True(t, isSafeRetryablePostgresError(&safeToRetryErr{msg: "pre-send commit"}))
+
+	// driver.ErrBadConn is NOT retryable here (the commit classifier doesn't
+	// check it — see the comment above).
+	require.False(t, isSafeRetryablePostgresError(driver.ErrBadConn))
 
 	// SQLSTATE codes that the server guarantees were rolled back.
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P01"})) // admin_shutdown
