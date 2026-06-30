@@ -350,29 +350,14 @@ func TestRetryPostgresTx(t *testing.T) {
 }
 
 func TestIsSafeRetryablePostgresError(t *testing.T) {
-	// isSafeRetryablePostgresError is the OPT-IN commit-phase classifier for
-	// RetryPostgresTx: pre-send guarantees + server-rolled-back SQLSTATE codes.
-	// Network errors are excluded (at commit, a network error could mean the
-	// commit succeeded but the response was lost — see ErrCommitPhase). The
-	// pre-commit classifier (isRetryablePostgresPreCommitError) is a separate
-	// OPT-OUT classifier that retries a broader set.
-	//
-	// driver.ErrBadConn is intentionally NOT in this classifier: pgx's
-	// wrapTx.Commit returns native pgx errors (not driver.ErrBadConn), so the
-	// commit path never sees it. The pre-send commit case is covered by
-	// pgconn.SafeToRetry below. driver.ErrBadConn from fn's tx.Exec IS
-	// retryable, but that's a pre-commit error handled by the opt-out catch-all
-	// (see TestIsRetryablePostgresPreCommitError).
+	// Commit-phase classifier (opt-in): pre-send + server-rolled-back only.
+	// driver.ErrBadConn excluded — see isSafeRetryablePostgresError doc.
 
-	// Pre-send: pgconn.SafeToRetry-flagged errors. Safe at any phase because
-	// the operation never reached the server.
-	require.True(t, isSafeRetryablePostgresError(&safeToRetryErr{msg: "pre-send commit"}))
+	require.True(t, isSafeRetryablePostgresError(&safeToRetryErr{msg: "pre-send commit"})) // SafeToRetry-flagged
 
-	// driver.ErrBadConn is NOT retryable here (the commit classifier doesn't
-	// check it — see the comment above).
-	require.False(t, isSafeRetryablePostgresError(driver.ErrBadConn))
+	require.False(t, isSafeRetryablePostgresError(driver.ErrBadConn)) // not checked at commit
 
-	// SQLSTATE codes that the server guarantees were rolled back.
+	// Server-rolled-back SQLSTATE codes.
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P01"})) // admin_shutdown
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P02"})) // crash_shutdown
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P03"})) // cannot_connect_now
@@ -381,13 +366,9 @@ func TestIsSafeRetryablePostgresError(t *testing.T) {
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "53300"})) // too_many_connections
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57014"})) // query_canceled
 
-	// Permanent application errors are not retryable (would fail again).
+	// Permanent + network + context errors not retryable here.
 	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "23505"})) // unique_violation
 	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "42601"})) // syntax_error
-
-	// Network errors are NOT retryable here: without a transaction there's no
-	// way to know if the query landed, and at commit time a network error
-	// could mean the commit succeeded but the response was lost (ErrCommitPhase).
 	require.False(t, isSafeRetryablePostgresError(nil))
 	require.False(t, isSafeRetryablePostgresError(io.EOF))
 	require.False(t, isSafeRetryablePostgresError(io.ErrUnexpectedEOF))
@@ -397,17 +378,15 @@ func TestIsSafeRetryablePostgresError(t *testing.T) {
 }
 
 func TestIsRetryablePostgresPreCommitError(t *testing.T) {
-	// isRetryablePostgresPreCommitError is an OPT-OUT classifier: pre-commit
-	// retrying is always safe (the transaction rolls back), so it retries
-	// everything EXCEPT context.Canceled/DeadlineExceeded and the permanent
-	// SQLSTATE classes (22xxx, 23xxx, 42xxx).
+	// Pre-commit classifier (opt-out): retries everything except context
+	// cancellation and permanent SQLSTATE classes (22xxx/23xxx/42xxx).
 
 	// Retried: pre-send guarantees.
 	require.True(t, isRetryablePostgresPreCommitError(driver.ErrBadConn))
 	require.True(t, isRetryablePostgresPreCommitError(fmt.Errorf("wrapped: %w", driver.ErrBadConn)))
 	require.True(t, isRetryablePostgresPreCommitError(&safeToRetryErr{msg: "pre-send"}))
 
-	// Retried: known-transient SQLSTATE codes (server rolled back).
+	// Retried: known-transient SQLSTATE (server rolled back).
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "40001"})) // serialization_failure
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "40P01"})) // deadlock_detected
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "57P01"})) // admin_shutdown
@@ -420,19 +399,13 @@ func TestIsRetryablePostgresPreCommitError(t *testing.T) {
 		Err: errors.New("connection reset by peer"),
 	}))
 
-	// Retried (opt-out): an UNKNOWN *pgconn.PgError code is retried because
-	// pre-commit it's safe and we'd rather not miss a transient error we
-	// haven't enumerated. XX000 (internal_error) is not in the permanent
-	// blocklist, so it's retried.
-	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "XX000"})) // internal_error (unknown/transient)
-
-	// Retried (opt-out): a non-PgError, non-network error is retried. fn might
-	// return a wrapped error; pre-commit retrying is safe, and the cost of a
-	// false positive (200ms wasted on a permanent error) is less than the cost
-	// of a false negative (spurious user-facing failure).
+	// Retried: unknown PgError codes (not in the permanent blocklist) and
+	// arbitrary non-PgError errors — opt-out assumes retryable unless known
+	// permanent.
+	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "XX000"})) // internal_error (unknown)
 	require.True(t, isRetryablePostgresPreCommitError(errors.New("some application error")))
 
-	// NOT retried: permanent SQLSTATE classes (would fail again on retry).
+	// NOT retried: permanent SQLSTATE classes.
 	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "23505"})) // 23xxx unique_violation
 	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "23503"})) // 23xxx foreign_key_violation
 	require.False(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "22001"})) // 22xxx string_data_right_truncation

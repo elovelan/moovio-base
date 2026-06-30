@@ -46,14 +46,9 @@ func SpannerUniqueViolation(err error) bool {
 
 // RetrySpannerTx is the Spanner equivalent of RetryPostgresTx.
 // TODO: consider delegating to spannerdriver.RunTransactionWithOptions for
-// ABORTED replay (it replays statements + buffered mutations on a new
-// transaction and surfaces ErrAbortedDueToConcurrentModification when the
-// replay sees different data), plus network-error retry on top. The shared
-// retryTx helper in retry.go already handles driver.ErrBadConn
-// (backend-agnostic) and the Begin/fn/Commit/Rollback loop; the missing
-// piece is a Spanner-specific default classifier analogous to
-// isRetryablePostgresTxError. See
-// https://pkg.go.dev/github.com/googleapis/go-sql-spanner
+// ABORTED replay, plus network retry. retryTx already handles the loop and
+// driver.ErrBadConn; the missing piece is a Spanner-specific retryClassifier.
+// See https://pkg.go.dev/github.com/googleapis/go-sql-spanner
 func RetrySpannerTx(ctx context.Context, db *sql.DB, opts RetryTxOptions, fn func(*sql.Tx) error) error {
 	_ = ctx
 	_ = db
