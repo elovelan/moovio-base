@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
@@ -43,11 +44,21 @@ type mockDriver struct {
 	commitErrs    []error
 	rollbackErrs  []error
 	execErrs      []error
-	mu            sync.Mutex
-	beginCalls    int
-	commitCalls   int
-	rollbackCalls int
-	execCalls     int
+	// Commit-verification scripting (matched by query substring in QueryContext):
+	// captureXidResult is returned for pg_current_xact_id_if_assigned (a string
+	// xid, or nil for read-only/NULL); verifyStatusResult for pg_xact_status
+	// ("aborted"/"committed"/"in progress"/"" for NULL); verifyErr makes the
+	// pg_xact_status query fail.
+	captureXidResult   any
+	verifyStatusResult string
+	verifyErr          error
+	mu                 sync.Mutex
+	beginCalls         int
+	commitCalls        int
+	rollbackCalls      int
+	execCalls          int
+	captureCalls       int
+	verifyCalls        int
 }
 
 func (d *mockDriver) Open(string) (driver.Conn, error) { return &mockConn{d: d}, nil }
@@ -93,6 +104,26 @@ func (c *mockConn) PrepareContext(context.Context, string) (driver.Stmt, error) 
 	return nil, errors.New("mockDriver: PrepareContext not implemented")
 }
 
+// QueryContext implements driver.QueryerContext so *sql.Tx.QueryRow and
+// *sql.DB.QueryRowContext work. It recognizes the commit-verification queries
+// (by substring) and returns the scripted value from the driver.
+func (c *mockConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	c.d.mu.Lock()
+	defer c.d.mu.Unlock()
+	switch {
+	case strings.Contains(query, "pg_current_xact_id_if_assigned"):
+		c.d.captureCalls++
+		return &mockRows{val: c.d.captureXidResult}, nil
+	case strings.Contains(query, "pg_xact_status"):
+		c.d.verifyCalls++
+		if c.d.verifyErr != nil {
+			return nil, c.d.verifyErr
+		}
+		return &mockRows{val: c.d.verifyStatusResult}, nil
+	}
+	return nil, errors.New("mockDriver: unexpected query: " + query)
+}
+
 type mockTx struct{ d *mockDriver }
 
 func (t *mockTx) Commit() error {
@@ -102,6 +133,24 @@ func (t *mockTx) Commit() error {
 func (t *mockTx) Rollback() error {
 	_, err := t.d.nthRollback()
 	return err
+}
+
+// mockRows is a single-row, single-column result set holding val (a string, or
+// nil for SQL NULL). Used by QueryContext for the verification queries.
+type mockRows struct {
+	val  any
+	read bool
+}
+
+func (r *mockRows) Columns() []string { return []string{"col"} }
+func (r *mockRows) Close() error      { return nil }
+func (r *mockRows) Next(dest []driver.Value) error {
+	if r.read {
+		return io.EOF
+	}
+	r.read = true
+	dest[0] = r.val
+	return nil
 }
 
 // nthErr returns errs[i] or nil when i is out of range. Tests pass a sequence
@@ -232,13 +281,15 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 		require.Equal(t, 2, d.commitCalls) // first commit failed, second succeeded
 	})
 
-	t.Run("commit-phase network error is NOT retried and is wrapped with ErrCommitPhase", func(t *testing.T) {
+	t.Run("commit-phase network error with inconclusive verification is wrapped with ErrCommitPhase", func(t *testing.T) {
 		// A network error during commit could mean the commit succeeded but the
-		// response was lost, so the narrow commit classifier does NOT retry it.
-		// It is returned to the caller wrapped with ErrCommitPhase so the caller
-		// can detect the ambiguous commit-phase failure.
+		// response was lost. The commit classifier rejects it; verification
+		// (pg_xact_status) returns NULL (inconclusive, e.g. xid not yet visible
+		// after a failover) → ambiguous → ErrCommitPhase (caller decides).
 		d := &mockDriver{
-			commitErrs: []error{io.EOF},
+			captureXidResult:   "1", // write transaction, has an xid
+			verifyStatusResult: "",  // NULL → inconclusive
+			commitErrs:         []error{io.EOF},
 		}
 		db := newMockDB(d)
 		defer db.Close()
@@ -250,19 +301,21 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 		})
 		require.Error(t, err)
 		require.Equal(t, 1, calls)          // not retried
-		require.Equal(t, 1, d.beginCalls)
-		require.Equal(t, 1, d.commitCalls)  // commit was attempted (and failed)
+		require.Equal(t, 1, d.commitCalls)
 		require.Equal(t, 0, d.rollbackCalls) // commit failed; rollback is a no-op (ErrTxDone)
+		require.Equal(t, 1, d.captureCalls)  // xid captured before commit
+		require.Equal(t, 1, d.verifyCalls)   // pg_xact_status queried once
 		require.ErrorIs(t, err, ErrCommitPhase)
 		require.ErrorIs(t, err, io.EOF) // underlying error preserved
 	})
 
-	t.Run("commit-phase admin_shutdown (57P01) is NOT retried and is wrapped with ErrCommitPhase", func(t *testing.T) {
-		// 57P01 is excluded from the commit classifier: die() can interrupt after
-		// the commit is recorded, so 57P01 at commit could mean "possibly
-		// committed". Conservatively wrap with ErrCommitPhase (caller decides).
+	t.Run("commit-phase admin_shutdown (57P01) with inconclusive verification is wrapped with ErrCommitPhase", func(t *testing.T) {
+		// 57P01 is excluded from the commit classifier; verification inconclusive
+		// → ErrCommitPhase.
 		d := &mockDriver{
-			commitErrs: []error{&pgconn.PgError{Code: pgerrcode.AdminShutdown}},
+			captureXidResult:   "1",
+			verifyStatusResult: "",
+			commitErrs:         []error{&pgconn.PgError{Code: pgerrcode.AdminShutdown}},
 		}
 		db := newMockDB(d)
 		defer db.Close()
@@ -275,17 +328,112 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, 1, calls) // not retried
 		require.Equal(t, 1, d.commitCalls)
+		require.Equal(t, 1, d.verifyCalls)
 		require.ErrorIs(t, err, ErrCommitPhase)
 		var pgErr *pgconn.PgError
 		require.ErrorAs(t, err, &pgErr)
 		require.Equal(t, pgerrcode.AdminShutdown, pgErr.Code)
 	})
 
-	t.Run("commit-phase exhaustion wraps the final error with ErrCommitPhase", func(t *testing.T) {
-		// A retryable commit error (serialization_failure at commit) that never
-		// succeeds: the final error is a commit-phase error, so it is wrapped
-		// with ErrCommitPhase even though we exhausted attempts retrying it.
+	t.Run("commit-phase verify-aborted is retried", func(t *testing.T) {
+		// Network error at commit; pg_xact_status says aborted (commit didn't
+		// land) → safe to retry → second attempt succeeds.
 		d := &mockDriver{
+			captureXidResult:   "1",
+			verifyStatusResult: "aborted",
+			commitErrs:         []error{io.EOF, nil},
+		}
+		db := newMockDB(d)
+		defer db.Close()
+
+		calls := 0
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
+			calls++
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, 2, calls)
+		require.Equal(t, 2, d.commitCalls)
+		require.Equal(t, 1, d.verifyCalls) // verified once (first attempt's commit)
+	})
+
+	t.Run("commit-phase verify-committed returns ErrCommitted (not retried)", func(t *testing.T) {
+		// Network error at commit; pg_xact_status says committed (commit DID
+		// land) → must NOT retry (would duplicate) → ErrCommitted.
+		d := &mockDriver{
+			captureXidResult:   "1",
+			verifyStatusResult: "committed",
+			commitErrs:         []error{io.EOF},
+		}
+		db := newMockDB(d)
+		defer db.Close()
+
+		calls := 0
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
+			calls++
+			return nil
+		})
+		require.Error(t, err)
+		require.Equal(t, 1, calls) // not retried
+		require.Equal(t, 1, d.verifyCalls)
+		require.ErrorIs(t, err, ErrCommitted)
+		require.ErrorIs(t, err, io.EOF)    // underlying commit error preserved
+		require.NotErrorIs(t, err, ErrCommitPhase) // not ambiguous — verified committed
+	})
+
+	t.Run("commit-phase read-only (no xid) is retried without verifying", func(t *testing.T) {
+		// Read-only transaction (pg_current_xact_id_if_assigned returns NULL):
+		// no writes to duplicate, so retry is safe without calling pg_xact_status.
+		d := &mockDriver{
+			captureXidResult: nil, // read-only
+			commitErrs:       []error{io.EOF, nil},
+		}
+		db := newMockDB(d)
+		defer db.Close()
+
+		calls := 0
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
+			calls++
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, 2, calls)
+		require.Equal(t, 0, d.verifyCalls) // verification skipped (read-only)
+		require.Equal(t, 2, d.captureCalls)
+	})
+
+	t.Run("commit-phase verify-error is ambiguous (ErrCommitPhase)", func(t *testing.T) {
+		// pg_xact_status itself errors (e.g. the fresh connection also failed) →
+		// inconclusive → ErrCommitPhase.
+		d := &mockDriver{
+			captureXidResult: "1",
+			verifyErr:        errors.New("verify connection lost"),
+			commitErrs:       []error{io.EOF},
+		}
+		db := newMockDB(d)
+		defer db.Close()
+
+		calls := 0
+		err := RetryPostgresNonIdempotent(context.Background(), db, RetryNonIdempotentOptions{}, func(*sql.Tx) error {
+			calls++
+			return nil
+		})
+		require.Error(t, err)
+		require.Equal(t, 1, calls) // not retried
+		require.Equal(t, 1, d.verifyCalls)
+		require.ErrorIs(t, err, ErrCommitPhase)
+		require.ErrorIs(t, err, io.EOF)
+	})
+
+	t.Run("commit-phase class-40 exhaustion returns the original error (not ErrCommitPhase)", func(t *testing.T) {
+		// serialization_failure (class 40) at commit is retryable per the commit
+		// classifier (server rolled back → known non-commit). Retried until
+		// exhausted; the original error is returned (NOT ErrCommitPhase — it's
+		// not ambiguous, and verification isn't consulted for classifier-
+		// retryable commit errors).
+		d := &mockDriver{
+			captureXidResult:   "1",
+			verifyStatusResult: "aborted", // unused — classifier says retryable, verify not called
 			commitErrs: []error{
 				&pgconn.PgError{Code: pgerrcode.SerializationFailure},
 				&pgconn.PgError{Code: pgerrcode.SerializationFailure},
@@ -303,8 +451,8 @@ func TestRetryPostgresNonIdempotent(t *testing.T) {
 		require.Error(t, err)
 		require.Equal(t, 3, calls)
 		require.Equal(t, 3, d.commitCalls)
-		require.ErrorIs(t, err, ErrCommitPhase)
-		// The underlying *pgconn.PgError is preserved for inspection via errors.As.
+		require.Equal(t, 0, d.verifyCalls) // classifier-retryable → no verification
+		require.NotErrorIs(t, err, ErrCommitPhase) // known non-commit, not ambiguous
 		var pgErr *pgconn.PgError
 		require.ErrorAs(t, err, &pgErr)
 		require.Equal(t, pgerrcode.SerializationFailure, pgErr.Code)
@@ -480,4 +628,16 @@ func TestErrCommitPhase(t *testing.T) {
 	// A bare (non-commit-phase) error is NOT ErrCommitPhase.
 	require.NotErrorIs(t, underlying, ErrCommitPhase)
 	require.NotErrorIs(t, io.EOF, ErrCommitPhase)
+}
+
+func TestErrCommitted(t *testing.T) {
+	// ErrCommitted wraps a commit error verified to have committed on the server
+	// (the response was lost). Callers detect it via errors.Is and must NOT retry.
+	underlying := errors.New("connection severed after commit recorded")
+	wrapped := fmt.Errorf("%w: %w", ErrCommitted, underlying)
+
+	require.ErrorIs(t, wrapped, ErrCommitted, "caller can detect verified-committed")
+	require.ErrorIs(t, wrapped, underlying, "underlying commit error preserved")
+	require.NotErrorIs(t, wrapped, ErrCommitPhase) // distinct from ambiguous ErrCommitPhase
+	require.NotErrorIs(t, io.EOF, ErrCommitted)
 }

@@ -255,24 +255,77 @@ func isRetryablePostgresPreCommitError(err error) bool {
 	return true
 }
 
-// RetryPostgresNonIdempotent runs fn in a Postgres transaction, retrying the whole
-// transaction on transient errors. fn gets a fresh *sql.Tx each attempt; if it
-// returns an error the tx is rolled back, if nil the tx is committed.
+// capturePostgresXid returns the current transaction's id (pg_current_xact_id_if_assigned)
+// as a string, or nil if no id is assigned (read-only transaction). Captured
+// before Commit so verifyPostgresCommit can check whether an ambiguous commit
+// landed. The ::text cast sidesteps pgx's xid8 Go type-mapping; the string is
+// passed back to pg_xact_status($1::xid8) on verification. Returns nil for
+// read-only transactions (no xid), in which case retryTx retries an ambiguous
+// commit without verifying (no writes to duplicate).
+func capturePostgresXid(tx *sql.Tx) (any, error) {
+	var s sql.NullString
+	if err := tx.QueryRow("SELECT pg_current_xact_id_if_assigned()::text").Scan(&s); err != nil {
+		return nil, err
+	}
+	if !s.Valid {
+		return nil, nil // read-only, no xid assigned
+	}
+	return s.String, nil
+}
+
+// verifyPostgresCommit checks whether the transaction with the given xid
+// committed, aborted, or is indeterminate, via pg_xact_status on a fresh
+// connection (the original may be dead). xid is the string from
+// capturePostgresXid. Returns:
+//   - commitStatusAborted: the commit did NOT land → safe to retry.
+//   - commitStatusCommitted: the commit DID land → don't retry (ErrCommitted).
+//   - commitStatusUnknown: pg_xact_status returned NULL (xid too old, or not
+//     yet visible after a failover) or errored, or status was "in progress" →
+//     ambiguous (ErrCommitPhase).
+func verifyPostgresCommit(ctx context.Context, db retryDB, xid any) (commitStatus, error) {
+	s, ok := xid.(string)
+	if !ok || s == "" {
+		return commitStatusUnknown, nil
+	}
+	var status sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT pg_xact_status($1::xid8)", s).Scan(&status); err != nil {
+		return commitStatusUnknown, err
+	}
+	switch status.String {
+	case "aborted":
+		return commitStatusAborted, nil
+	case "committed":
+		return commitStatusCommitted, nil
+	default: // "" (NULL), "in progress", or unexpected → ambiguous
+		return commitStatusUnknown, nil
+	}
+}
+
+// RetryPostgresNonIdempotent runs fn in a Postgres transaction, retrying the
+// whole transaction on transient errors. fn gets a fresh *sql.Tx each attempt;
+// if it returns an error the tx is rolled back, if nil the tx is committed.
 //
 // Pre-commit errors use the opt-out isRetryablePostgresPreCommitError; commit
-// errors use the narrower opt-in isSafeRetryablePostgresError (a commit-phase
-// network error may mean the commit already succeeded). Non-retried commit
-// errors are wrapped with ErrCommitPhase. opts.IsRetryable is additive on both.
+// errors use the narrower opt-in isSafeRetryablePostgresError. Commit-phase
+// errors the commit classifier rejects are verified: before each Commit the
+// transaction id is captured (pg_current_xact_id_if_assigned), and on an
+// ambiguous commit error pg_xact_status is queried on a fresh connection —
+// aborted → retry, committed → ErrCommitted (don't retry), inconclusive →
+// ErrCommitPhase. Read-only transactions (no xid) retry without verification.
+// opts.IsRetryable is additive on both classifiers.
 //
 // db must be pgx-backed (e.g. from database.New with a PostgresConfig); other
-// drivers won't get pgx-specific retries.
+// drivers won't get pgx-specific retries or commit verification.
 func RetryPostgresNonIdempotent(ctx context.Context, db *sql.DB, opts RetryNonIdempotentOptions, fn func(*sql.Tx) error) error {
 	return retryTx(ctx, db, postgresTxClassifier, opts, fn)
 }
 
 // postgresTxClassifier pairs the pre-commit (opt-out) and commit (opt-in)
-// classifiers. See ErrCommitPhase.
+// classifiers with commit verification (capturePostgresXid/verifyPostgresCommit).
+// See ErrCommitPhase / ErrCommitted.
 var postgresTxClassifier = retryClassifier{
-	preCommit: isRetryablePostgresPreCommitError,
-	commit:    isSafeRetryablePostgresError,
+	preCommit:    isRetryablePostgresPreCommitError,
+	commit:       isSafeRetryablePostgresError,
+	captureXid:   capturePostgresXid,
+	verifyCommit: verifyPostgresCommit,
 }
