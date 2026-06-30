@@ -177,13 +177,20 @@ func PostgresDeadlockFound(err error) bool {
 }
 
 // isSafeRetryablePostgresError is the commit-phase classifier for
-// RetryPostgresTx: true iff the error guarantees no side effects (pre-send or
-// server-rolled-back), so retry is safe even at commit.
+// RetryPostgresTx: true iff the error guarantees the commit didn't happen, so
+// retry is safe even at commit.
 //
 //	- pgconn.SafeToRetry: pgx guarantees the error occurred before any data
 //	  was sent to the server.
-//	- SQLSTATE codes the server rolled back before returning: 40001, 40P01,
-//	  57P01, 57P02, 57P03, 53300, 57014.
+//	- SQLSTATE codes that guarantee non-commit: 40001, 40P01, 57014 (server
+//	  rejected + rolled back), 57P01 (die() aborts the in-flight tx), 57P03,
+//	  53300 (connect-time, never started a tx).
+//
+// 57P02 (crash_shutdown) excluded: quickdie() does _exit(2) WITHOUT rolling
+// back (rollback is via crash recovery on restart), and the commit may have
+// been recorded before SIGQUIT — so 57P02 at commit is ambiguous. It's still
+// retried pre-commit via isRetryablePostgresPreCommitError's opt-out (the tx
+// didn't commit). See ErrCommitPhase.
 //
 // driver.ErrBadConn not checked: pgx's Commit returns native errors (the
 // ErrBadConn conversion is only in Exec/Query), so the commit path never sees
@@ -201,16 +208,20 @@ func isSafeRetryablePostgresError(err error) bool {
 	if pgconn.SafeToRetry(err) {
 		return true
 	}
-	// SQLSTATE codes the server rolled back (or never started a tx) before
-	// returning — safe to retry. See:
-	//   https://www.postgresql.org/docs/current/server-shutdown.html (57P01/57P02/57P03)
-	//   https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html (40001/40P01)
-	// 53300 too_many_connections and 57014 query_canceled also rolled back.
+	// SQLSTATE codes that guarantee the commit didn't happen:
+	//   40001 serialization_failure, 40P01 deadlock_detected — server rejected
+	//   the commit and rolled back (ErrorResponse proves non-commit). See
+	//   https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html
+	//   57P01 admin_shutdown — die() aborts the in-flight tx before sending.
+	//   57P03 cannot_connect_now, 53300 too_many_connections — connect-time
+	//   rejections (won't surface from Commit, but harmless).
+	//   57014 query_canceled — server canceled and rolled back.
+	// 57P02 (crash_shutdown) excluded — see doc comment above.
 	// 08xxx omitted: pgx surfaces those as network errors, not *pgconn.PgError.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
-		case "57P01", "57P02", "57P03", // admin/crash shutdown, cannot_connect_now
+		case "57P01", "57P03", // admin_shutdown, cannot_connect_now
 			"40001", "40P01", // serialization_failure, deadlock_detected
 			"53300", // too_many_connections
 			"57014": // query_canceled

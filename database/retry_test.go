@@ -350,21 +350,24 @@ func TestRetryPostgresTx(t *testing.T) {
 }
 
 func TestIsSafeRetryablePostgresError(t *testing.T) {
-	// Commit-phase classifier (opt-in): pre-send + server-rolled-back only.
-	// driver.ErrBadConn excluded — see isSafeRetryablePostgresError doc.
+	// Commit-phase classifier (opt-in): only errors that guarantee the commit
+	// didn't happen. driver.ErrBadConn and 57P02 excluded — see doc.
 
 	require.True(t, isSafeRetryablePostgresError(&safeToRetryErr{msg: "pre-send commit"})) // SafeToRetry-flagged
 
 	require.False(t, isSafeRetryablePostgresError(driver.ErrBadConn)) // not checked at commit
 
-	// Server-rolled-back SQLSTATE codes.
-	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P01"})) // admin_shutdown
-	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P02"})) // crash_shutdown
+	// SQLSTATE codes that guarantee non-commit.
+	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P01"})) // admin_shutdown (die() aborts tx)
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P03"})) // cannot_connect_now
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "40001"})) // serialization_failure
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "40P01"})) // deadlock_detected
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "53300"})) // too_many_connections
 	require.True(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57014"})) // query_canceled
+
+	// 57P02 crash_shutdown excluded: quickdie() does _exit(2) without rollback,
+	// and the commit may have been recorded before SIGQUIT — ambiguous at commit.
+	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "57P02"}))
 
 	// Permanent + network + context errors not retryable here.
 	require.False(t, isSafeRetryablePostgresError(&pgconn.PgError{Code: "23505"})) // unique_violation
@@ -386,10 +389,14 @@ func TestIsRetryablePostgresPreCommitError(t *testing.T) {
 	require.True(t, isRetryablePostgresPreCommitError(fmt.Errorf("wrapped: %w", driver.ErrBadConn)))
 	require.True(t, isRetryablePostgresPreCommitError(&safeToRetryErr{msg: "pre-send"}))
 
-	// Retried: known-transient SQLSTATE (server rolled back).
+	// Retried: known-transient SQLSTATE (server rolled back or tx didn't commit).
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "40001"})) // serialization_failure
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "40P01"})) // deadlock_detected
 	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "57P01"})) // admin_shutdown
+	// 57P02 crash_shutdown is retried pre-commit: quickdie() skips rollback, but
+	// the tx didn't commit (process exited before committing) — safe pre-commit.
+	// (Excluded from the commit classifier — see TestIsSafeRetryablePostgresError.)
+	require.True(t, isRetryablePostgresPreCommitError(&pgconn.PgError{Code: "57P02"})) // crash_shutdown
 
 	// Retried: typed network errors (non-PgError -> retry under opt-out).
 	require.True(t, isRetryablePostgresPreCommitError(io.EOF))
