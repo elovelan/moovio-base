@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/moov-io/base"
 	"github.com/moov-io/base/database"
@@ -201,7 +202,7 @@ func TestRetryUnsafe(t *testing.T) {
 		err := database.RetryUnsafe(context.Background(), database.RetryUnsafeOptions{}, func() error {
 			calls++
 			if calls < 3 {
-				return &pgconn.PgError{Code: "23505"} // unique_violation
+				return &pgconn.PgError{Code: pgerrcode.UniqueViolation}
 			}
 			return nil
 		})

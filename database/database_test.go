@@ -12,6 +12,7 @@ import (
 	"time"
 
 	gomysql "github.com/go-sql-driver/mysql"
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/moov-io/base/database"
 	"github.com/moov-io/base/log"
@@ -38,7 +39,7 @@ func TestUniqueViolation(t *testing.T) {
 		t.Error("should have matched postgres unique violation")
 	}
 	pgconnErr := &pgconn.PgError{
-		Code: "23505",
+		Code: pgerrcode.UniqueViolation,
 	}
 	if !database.UniqueViolation(pgconnErr) {
 		t.Error("should have matched PgError unique violation")
@@ -78,7 +79,7 @@ func TestDeadlockFound(t *testing.T) {
 		t.Error("should have matched postgres deadlock found")
 	}
 	pgconnErr := &pgconn.PgError{
-		Code: "40P01",
+		Code: pgerrcode.DeadlockDetected,
 	}
 	if !database.DeadlockFound(pgconnErr) {
 		t.Error("should have matched PgError deadlock found")

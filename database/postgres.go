@@ -10,17 +10,11 @@ import (
 	"time"
 
 	"cloud.google.com/go/alloydbconn"
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/moov-io/base/log"
-)
-
-const (
-	// PostgreSQL Error Codes
-	// https://www.postgresql.org/docs/current/errcodes-appendix.html
-	postgresErrUniqueViolation = "23505"
-	postgresErrDeadlockFound   = "40P01"
 )
 
 func postgresConnection(ctx context.Context, logger log.Logger, config PostgresConfig, databaseName string) (*sql.DB, error) {
@@ -154,11 +148,11 @@ func PostgresUniqueViolation(err error) bool {
 	}
 
 	var pgError *pgconn.PgError
-	if errors.As(err, &pgError) && pgError.Code == postgresErrUniqueViolation {
+	if errors.As(err, &pgError) && pgError.Code == pgerrcode.UniqueViolation {
 		return true
 	}
 
-	return strings.Contains(err.Error(), postgresErrUniqueViolation)
+	return strings.Contains(err.Error(), pgerrcode.UniqueViolation)
 }
 
 // PostgresDeadlockFound returns true when the provided error matches the Postgres code
@@ -169,36 +163,40 @@ func PostgresDeadlockFound(err error) bool {
 	}
 
 	var pgError *pgconn.PgError
-	if errors.As(err, &pgError) && pgError.Code == postgresErrDeadlockFound {
+	if errors.As(err, &pgError) && pgError.Code == pgerrcode.DeadlockDetected {
 		return true
 	}
 
-	return strings.Contains(err.Error(), postgresErrDeadlockFound)
+	return strings.Contains(err.Error(), pgerrcode.DeadlockDetected)
 }
 
 // isSafeRetryablePostgresError is the commit-phase classifier for
 // RetryPostgresTx: true iff the error guarantees the commit didn't happen, so
-// retry is safe even at commit.
+// retry is safe even at commit. Maximally conservative — only errors that can
+// NEVER mean "possibly committed":
 //
 //	- pgconn.SafeToRetry: pgx guarantees the error occurred before any data
-//	  was sent to the server.
-//	- SQLSTATE codes that guarantee non-commit: 40001, 40P01, 57014 (server
-//	  rejected + rolled back), 57P01 (die() aborts the in-flight tx), 57P03,
-//	  53300 (connect-time, never started a tx).
+//	  was sent to the server (COMMIT message never sent).
+//	- pgerrcode.IsTransactionRollback: class 40 SQLSTATE codes (40001
+//	  serialization_failure, 40P01 deadlock_detected, 40002, 40003, 40000) —
+//	  the server rolled back the transaction before returning the ErrorResponse.
+//	  See https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html
 //
-// 57P02 (crash_shutdown) excluded: quickdie() does _exit(2) WITHOUT rolling
-// back (rollback is via crash recovery on restart), and the commit may have
-// been recorded before SIGQUIT — so 57P02 at commit is ambiguous. It's still
-// retried pre-commit via isRetryablePostgresPreCommitError's opt-out (the tx
-// didn't commit). See ErrCommitPhase.
+// Excluded (could mean "possibly committed" → wrapped with ErrCommitPhase):
+//	- 57P01 admin_shutdown, 57P02 crash_shutdown: die()/quickdie() are signal
+//	  handlers that can interrupt after the commit is recorded but before the
+//	  response is sent. quickdie() also skips rollback (_exit(2)).
+//	- 57014 query_canceled: a cancel arriving after the commit records is a
+//	  theoretical edge case.
+//	- 57P03/53300: connect-time, won't surface from Commit.
+//	- network errors: could mean commit succeeded but the response was lost.
+//	- driver.ErrBadConn: pgx's Commit returns native errors (the ErrBadConn
+//	  conversion is only in Exec/Query), so the commit path never sees it;
+//	  pre-send commit is covered by pgconn.SafeToRetry. *sql.Tx.Commit doesn't
+//	  retry ErrBadConn internally (only *sql.DB methods do).
 //
-// driver.ErrBadConn not checked: pgx's Commit returns native errors (the
-// ErrBadConn conversion is only in Exec/Query), so the commit path never sees
-// it; pre-send commit is covered by pgconn.SafeToRetry. *sql.Tx.Commit doesn't
-// retry ErrBadConn internally (only *sql.DB methods do), so no double-retry.
-//
-// Network errors excluded: at commit, could mean commit succeeded but the
-// response was lost (see ErrCommitPhase).
+// Everything excluded here is still retried pre-commit via
+// isRetryablePostgresPreCommitError's opt-out (the tx didn't commit pre-commit).
 //
 // Unexported: use RetryPostgresTx or RetryUnsafe rather than building on this.
 func isSafeRetryablePostgresError(err error) bool {
@@ -208,25 +206,9 @@ func isSafeRetryablePostgresError(err error) bool {
 	if pgconn.SafeToRetry(err) {
 		return true
 	}
-	// SQLSTATE codes that guarantee the commit didn't happen:
-	//   40001 serialization_failure, 40P01 deadlock_detected — server rejected
-	//   the commit and rolled back (ErrorResponse proves non-commit). See
-	//   https://www.postgresql.org/docs/current/mvcc-serialization-failure-handling.html
-	//   57P01 admin_shutdown — die() aborts the in-flight tx before sending.
-	//   57P03 cannot_connect_now, 53300 too_many_connections — connect-time
-	//   rejections (won't surface from Commit, but harmless).
-	//   57014 query_canceled — server canceled and rolled back.
-	// 57P02 (crash_shutdown) excluded — see doc comment above.
-	// 08xxx omitted: pgx surfaces those as network errors, not *pgconn.PgError.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "57P01", "57P03", // admin_shutdown, cannot_connect_now
-			"40001", "40P01", // serialization_failure, deadlock_detected
-			"53300", // too_many_connections
-			"57014": // query_canceled
-			return true
-		}
+		return pgerrcode.IsTransactionRollback(pgErr.Code)
 	}
 	return false
 }
@@ -234,14 +216,10 @@ func isSafeRetryablePostgresError(err error) bool {
 // isPermanentPostgresError reports SQLSTATE classes that would fail again on
 // retry, used by isRetryablePostgresPreCommitError to opt out. Only
 // clearly-permanent classes are listed so unknown/transient codes are retried.
-//
-//	- 22xxx data exceptions (e.g. 22001 string_data_right_truncation)
-//	- 23xxx integrity constraint violations (e.g. 23505 unique_violation)
-//	- 42xxx syntax/access-rule violations (42501, 42601, 42P01, 42703, 42804)
 func isPermanentPostgresError(pgErr *pgconn.PgError) bool {
-	return strings.HasPrefix(pgErr.Code, "22") || // data exception
-		strings.HasPrefix(pgErr.Code, "23") || // integrity constraint violation
-		strings.HasPrefix(pgErr.Code, "42") // syntax / access rule violation
+	return pgerrcode.IsDataException(pgErr.Code) || // class 22
+		pgerrcode.IsIntegrityConstraintViolation(pgErr.Code) || // class 23
+		pgerrcode.IsSyntaxErrororAccessRuleViolation(pgErr.Code) // class 42
 }
 
 // retryJitterMax is the upper bound on the random delay between retries. Full
