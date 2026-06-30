@@ -2,14 +2,13 @@ package database_test
 
 import (
 	"context"
-	"errors"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/moov-io/base"
 	"github.com/moov-io/base/database"
@@ -184,61 +183,10 @@ func Test_Postgres_Alloy_Migrations(t *testing.T) {
 	defer db.Close()
 }
 
-func TestIsRetryablePostgresError(t *testing.T) {
-	// nil error is not retryable
-	require.False(t, database.IsRetryablePostgresError(nil))
-
-	// admin_shutdown is retryable (seen during AlloyDB maintenance)
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "57P01"}))
-
-	// crash_shutdown is retryable
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "57P02"}))
-
-	// cannot_connect_now is retryable
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "57P03"}))
-
-	// serialization_failure and deadlock_detected are retryable (server rolled back)
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "40001"}))
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "40P01"}))
-
-	// too_many_connections is retryable (rejected at connect time)
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "53300"}))
-
-	// query_canceled is retryable (server rolled back the transaction)
-	require.True(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "57014"}))
-
-	// unique_violation is NOT retryable (application-level error)
-	require.False(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "23505"}))
-
-	// syntax_error is NOT retryable
-	require.False(t, database.IsRetryablePostgresError(&pgconn.PgError{Code: "42601"}))
-
-	// EOF is retryable (connection severed)
-	require.True(t, database.IsRetryablePostgresError(io.EOF))
-	require.True(t, database.IsRetryablePostgresError(io.ErrUnexpectedEOF))
-
-	// net.OpError is retryable
-	require.True(t, database.IsRetryablePostgresError(&net.OpError{
-		Op:  "read",
-		Err: errors.New("connection reset by peer"),
-	}))
-
-	// context.DeadlineExceeded is NOT retryable
-	require.False(t, database.IsRetryablePostgresError(context.DeadlineExceeded))
-
-	// String-matched connection errors
-	require.True(t, database.IsRetryablePostgresError(errors.New("connection reset by peer")))
-	require.True(t, database.IsRetryablePostgresError(errors.New("broken pipe")))
-	require.True(t, database.IsRetryablePostgresError(errors.New("conn closed")))
-
-	// Random application error is NOT retryable
-	require.False(t, database.IsRetryablePostgresError(errors.New("invalid input")))
-}
-
-func TestRetryPostgres(t *testing.T) {
+func TestRetryIdempotent(t *testing.T) {
 	t.Run("succeeds on first attempt", func(t *testing.T) {
 		calls := 0
-		err := database.RetryPostgres(context.Background(), 3, func() error {
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{}, func() error {
 			calls++
 			return nil
 		})
@@ -246,12 +194,15 @@ func TestRetryPostgres(t *testing.T) {
 		require.Equal(t, 1, calls)
 	})
 
-	t.Run("retries on transient error then succeeds", func(t *testing.T) {
+	t.Run("retries on any error by default, including non-Pg-retryable ones", func(t *testing.T) {
+		// unique_violation is NOT retryable per IsRetryablePostgresError, but
+		// RetryIdempotent's default predicate retries any error except context
+		// cancellation because the caller has vouched that fn is idempotent.
 		calls := 0
-		err := database.RetryPostgres(context.Background(), 3, func() error {
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{}, func() error {
 			calls++
 			if calls < 3 {
-				return &pgconn.PgError{Code: "57P01"} // admin_shutdown
+				return &pgconn.PgError{Code: pgerrcode.UniqueViolation}
 			}
 			return nil
 		})
@@ -259,33 +210,46 @@ func TestRetryPostgres(t *testing.T) {
 		require.Equal(t, 3, calls)
 	})
 
-	t.Run("does not retry non-retryable errors", func(t *testing.T) {
+	t.Run("custom IsRetryable short-circuits non-retryable errors", func(t *testing.T) {
 		calls := 0
-		err := database.RetryPostgres(context.Background(), 3, func() error {
+		neverRetry := func(error) bool { return false }
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{IsRetryable: neverRetry}, func() error {
 			calls++
-			return &pgconn.PgError{Code: "23505"} // unique_violation
+			return io.EOF
 		})
 		require.Error(t, err)
 		require.Equal(t, 1, calls)
+		require.ErrorIs(t, err, io.EOF)
 	})
 
-	t.Run("respects context cancellation", func(t *testing.T) {
+	t.Run("does not retry context cancellation by default", func(t *testing.T) {
+		calls := 0
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{}, func() error {
+			calls++
+			return context.Canceled
+		})
+		require.Error(t, err)
+		require.Equal(t, 1, calls)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("respects context cancellation between attempts", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // cancel immediately
 
 		calls := 0
-		err := database.RetryPostgres(ctx, 3, func() error {
+		err := database.RetryIdempotent(ctx, database.RetryIdempotentOptions{}, func() error {
 			calls++
 			return io.EOF // retryable, but context is done
 		})
-		// First call happens, then context cancellation is detected
+		// First call happens, then context cancellation is detected before the next attempt
 		require.ErrorIs(t, err, context.Canceled)
 		require.Equal(t, 1, calls)
 	})
 
 	t.Run("exhausts all attempts", func(t *testing.T) {
 		calls := 0
-		err := database.RetryPostgres(context.Background(), 3, func() error {
+		err := database.RetryIdempotent(context.Background(), database.RetryIdempotentOptions{}, func() error {
 			calls++
 			return io.EOF
 		})
